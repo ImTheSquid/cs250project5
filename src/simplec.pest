@@ -1,0 +1,88 @@
+WHITESPACE = _{ "\n" | "\r\n" | "\t" | " " }
+
+program = { WHITESPACE* ~ (function | decl)+ }
+
+type = { "char" | "long" | "void" }
+
+type_pointer = { type ~ pointer+ }
+
+pointer = { "*" }
+
+any_type = { type_pointer | type }
+
+integer = { "-"? ~ NUMBER+}
+
+string = { "\"" ~ inner ~ "\"" }
+
+inner = @{ char* }
+
+char = {
+    !("\"" | "\\") ~ ANY
+    | "\\" ~ ("\"" | "\\" | "/" | "b" | "f" | "n" | "r" | "t")
+    | "\\" ~ ("u" ~ ASCII_HEX_DIGIT{4})
+}
+
+literal = { integer | string }
+
+ident_name = { ASCII_ALPHA ~ ASCII_ALPHANUMERIC* }
+
+ident = { address_of* ~ ident_name }
+
+address_of = { "&" }
+
+primary_expr = { literal | call | array_access | "(" ~ expression ~ ")" | ident }
+
+array_access = { ident ~ "[" ~ expression ~ "]" }
+
+decl = { any_type ~ decl_ident_list ~ ";" }
+
+decl_ident_list = { (ident_name ~ ",")* ~ ident_name | ident_name }
+
+function = { any_type ~ ident ~ "(" ~ function_arg_list? ~ ")" ~ "{" ~ statement_list ~ "}" }
+
+function_arg_list = { (function_arg ~ ",")* ~ function_arg }
+
+function_arg = { any_type ~ ident }
+
+statement_list = { (if_expr | while_expr | do_while_expr | for_expr | flow_control | decl | assignment ~ ";" | call ~ ";")* }
+
+// Dereferencing pointers is not allowed
+assignment = { ident_name ~ "=" ~ expression }
+
+call = { ident ~ "(" ~ call_list? ~ ")" }
+
+call_list = { (expression ~ ",")* ~ expression }
+
+if_expr = { "if" ~ "(" ~ expression ~ ")" ~ "{" ~ statement_list ~ "}" ~ else_expr? }
+
+else_expr = { "else" ~ "{" ~ statement_list ~ "}" }
+
+while_expr = { "while" ~ "(" ~ expression ~ ")" ~ "{" ~ statement_list ~ "}" }
+
+do_while_expr = { "do" ~ "{" ~ statement_list ~ "}" ~ "while" ~ "(" ~ expression ~ ")" ~ ";" }
+
+for_expr = { "for" ~ "(" ~ assignment ~ expression ~ ";" ~ assignment ~ ")" ~ "{" ~ statement_list ~ "}" }
+
+flow_control = { ("continue" | "break" | "return" ~ expression) ~ ";"}
+
+expression = { logical_or_expr }
+
+logical_or_expr = { (logical_and_expr ~ "||")+ ~ logical_and_expr | logical_and_expr }
+
+logical_and_expr = { (equality_expr ~ "&&")+ ~ equality_expr | equality_expr }
+
+equality_expr = { relational_expr ~ equality_type ~ relational_expr | relational_expr }
+
+equality_type = { "!=" | "==" }
+
+relational_expr = { additive_expr ~ relation_type ~ additive_expr | additive_expr }
+
+relation_type = { "<" | ">" | "<=" | ">=" }
+
+additive_expr = { (multiplicative_expr ~ add_type)+ ~ additive_expr | multiplicative_expr}
+
+add_type = { "+" | "-" }
+
+multiplicative_expr = { (primary_expr ~ mult_type)+ ~ multiplicative_expr | primary_expr }
+
+mult_type = { "*" | "/" | "%" }
