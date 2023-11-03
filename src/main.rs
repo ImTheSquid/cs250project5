@@ -328,7 +328,7 @@ fn main() {
 
     for (i, value) in strings.iter().enumerate() {
         writer
-            .write_all(format!(".data\nglobal_string_{i}:\n\t.string \"{value}\"\n").as_bytes())
+            .write_all(format!(".data\nglobal_string_{i}:\n\t.string {value}\n").as_bytes())
             .unwrap();
     }
 
