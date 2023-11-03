@@ -1,4 +1,5 @@
 WHITESPACE = _{ "\n" | "\r\n" | "\t" | " " }
+COMMENT = _{ ("//" ~ (!"\n" ~ ANY)* ~ "\n") | ("/*" ~ (!"*/" ~ ANY)* ~ "*/") }
 
 program = { WHITESPACE* ~ (function | decl)+ }
 
@@ -77,7 +78,7 @@ equality_type = { "!=" | "==" }
 
 relational_expr = { additive_expr ~ relation_type ~ additive_expr | additive_expr }
 
-relation_type = { "<" | ">" | "<=" | ">=" }
+relation_type = { "<=" | ">=" | "<" | ">" }
 
 additive_expr = { (multiplicative_expr ~ add_type)+ ~ additive_expr | multiplicative_expr}
 

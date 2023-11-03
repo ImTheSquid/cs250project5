@@ -11,6 +11,7 @@ use clap::Parser as ClapParser;
 use dyn_clone::DynClone;
 use pest::{iterators::Pair, Parser};
 use pest_derive::Parser;
+use rand::distributions::{Alphanumeric, DistString};
 
 #[derive(Debug, ClapParser)]
 struct Args {
@@ -43,7 +44,12 @@ struct SimpleCParser;
 
 /// Any place you can store to and retrieve from
 /// Examples include Registers, the Stack, and RAM
-trait Memory: ToString + Debug + DynClone {}
+trait Memory: ToString + Debug + DynClone {
+    // Decides whether a dereference is necessary
+    fn is_register(&self) -> bool;
+}
+
+dyn_clone::clone_trait_object!(Memory);
 
 #[derive(Debug, Clone, Copy)]
 enum CalleeSavedRegister {
@@ -62,18 +68,39 @@ const REGISTER_STACK: [CalleeSavedRegister; 5] = [
     CalleeSavedRegister::R15,
 ];
 
-impl Memory for CalleeSavedRegister {}
+impl Memory for CalleeSavedRegister {
+    fn is_register(&self) -> bool {
+        true
+    }
+}
 
 impl ToString for CalleeSavedRegister {
     fn to_string(&self) -> String {
         match self {
-            CalleeSavedRegister::Rbx => "rbx",
-            CalleeSavedRegister::R10 => "r10",
-            CalleeSavedRegister::R13 => "r13",
-            CalleeSavedRegister::R14 => "r14",
-            CalleeSavedRegister::R15 => "r15",
+            CalleeSavedRegister::Rbx => "%rbx",
+            CalleeSavedRegister::R10 => "%r10",
+            CalleeSavedRegister::R13 => "%r13",
+            CalleeSavedRegister::R14 => "%r14",
+            CalleeSavedRegister::R15 => "%r15",
         }
         .to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StackAllocation {
+    offset: usize,
+}
+
+impl ToString for StackAllocation {
+    fn to_string(&self) -> String {
+        todo!()
+    }
+}
+
+impl Memory for StackAllocation {
+    fn is_register(&self) -> bool {
+        true
     }
 }
 
@@ -96,17 +123,21 @@ const ARGUMENT_REGISTERS: [ArgumentRegister; 6] = [
     ArgumentRegister::R9,
 ];
 
-impl Memory for ArgumentRegister {}
+impl Memory for ArgumentRegister {
+    fn is_register(&self) -> bool {
+        false
+    }
+}
 
 impl ToString for ArgumentRegister {
     fn to_string(&self) -> String {
         match self {
-            ArgumentRegister::Rdi => "rdi",
-            ArgumentRegister::Rsi => "rsi",
-            ArgumentRegister::Rdx => "rdx",
-            ArgumentRegister::Rcx => "rcx",
-            ArgumentRegister::R8 => "r8",
-            ArgumentRegister::R9 => "r9",
+            ArgumentRegister::Rdi => "%rdi",
+            ArgumentRegister::Rsi => "%rsi",
+            ArgumentRegister::Rdx => "%rdx",
+            ArgumentRegister::Rcx => "%rcx",
+            ArgumentRegister::R8 => "%r8",
+            ArgumentRegister::R9 => "%r9",
         }
         .to_string()
     }
@@ -131,8 +162,9 @@ enum ProgramItem {
         target: Box<dyn Memory>,
     },
     Expression {
-        inner: (),
-        target: Box<dyn Memory>,
+        stack: Vec<ExpressionInstruction>,
+        output: Box<dyn Memory>,
+        destination: ExpressionDestination,
     },
 }
 
@@ -161,7 +193,7 @@ enum ProgramItem {
 // }
 
 impl ProgramItem {
-    fn write<W: Write>(&self, writer: &mut W) -> Result<(), std::io::Error> {
+    fn write<W: Write>(self, writer: &mut W) -> Result<(), std::io::Error> {
         match self {
             ProgramItem::Global(name) => {
                 writer.write_all(format!(".data\n\t.comm {name}, 8\n").as_bytes())
@@ -188,7 +220,7 @@ impl ProgramItem {
                 ];
 
                 for register in &callee_saved {
-                    writer.write_all(format!("\tpushq %{}\n", register.to_string()).as_bytes())?;
+                    writer.write_all(format!("\tpushq {}\n", register.to_string()).as_bytes())?;
                 }
 
                 // Content
@@ -199,7 +231,7 @@ impl ProgramItem {
                 // Restore registers
                 callee_saved.reverse();
                 for register in &callee_saved {
-                    writer.write_all(format!("\tpopq %{}\n", register.to_string()).as_bytes())?;
+                    writer.write_all(format!("\tpopq {}\n", register.to_string()).as_bytes())?;
                 }
 
                 // Leave and return
@@ -213,7 +245,7 @@ impl ProgramItem {
                     "More args than supported for function `{name}`"
                 );
 
-                for src in args.iter() {
+                for src in args {
                     // writer.write_all(format!("\tmovq %{} %{}\n", src.to_string(), dest.to_string()).as_bytes())?;
                     src.write(writer)?;
                 }
@@ -227,12 +259,16 @@ impl ProgramItem {
             }
             Self::StringLiteralLoad { id, target } => {
                 writer.write_all(
-                    format!("\tmovq $global_string_{id}, %{}", target.to_string()).as_bytes(),
+                    format!("\tmovq $global_string_{id}, {}", target.to_string()).as_bytes(),
                 )?;
 
                 Ok(())
             }
-            Self::Expression { inner, target } => todo!(),
+            Self::Expression { stack, output, destination } => {
+                println!("expression writing is hard");
+
+                Ok(())
+            },
         }
     }
 }
@@ -332,7 +368,31 @@ fn handle_global_decl(pair: Pair<'_, Rule>, globals: &mut HashSet<Variable>) -> 
         .collect()
 }
 
-struct MemoryManager {}
+#[derive(Debug, Default, Clone, Copy)]
+struct MemoryManager {
+    register_allocs: usize,
+    stack_allocs: usize,
+}
+
+impl MemoryManager {
+    fn next_free_memory(&mut self) -> Box<dyn Memory> {
+        if self.register_allocs < 4 {
+            self.register_allocs += 1;
+            Box::new(REGISTER_STACK[self.register_allocs - 1])
+        } else {
+            self.stack_allocs += 1;
+            Box::new(StackAllocation { offset: 8 * (self.stack_allocs - 1) })
+        }
+    }
+
+    fn memory_from_position(&self, position: usize) -> Box<dyn Memory> {
+        if position < 4 {
+            Box::new(REGISTER_STACK[position])
+        } else {
+            Box::new(StackAllocation { offset: 8 * (position - 4) })
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Variable {
@@ -396,6 +456,7 @@ fn handle_function(
     };
 
     let mut local_stack = Vec::<Variable>::new();
+    let mut memory = MemoryManager::default();
 
     // Function may not have a body
     let children = if let Some(statements) = statements {
@@ -406,7 +467,7 @@ fn handle_function(
                     handle_local_decl(statement, &mut local_stack, globals);
                     vec![]
                 }
-                Rule::assignment => handle_assignment(statement, strings),
+                Rule::assignment => vec![handle_assignment(statement, &mut memory, &local_stack, strings)],
                 Rule::call => todo!(),
                 Rule::if_expr => todo!(),
                 Rule::while_expr => todo!(),
@@ -458,17 +519,23 @@ fn handle_local_decl(
     }
 }
 
-fn handle_assignment(pair: Pair<'_, Rule>, strings: &mut Vec<String>) -> Vec<ProgramItem> {
+#[derive(Debug)]
+enum ExpressionDestination {
+    Variable(Variable),
+    ConditionalJump(JumpDestination)
+}
+
+fn handle_assignment(pair: Pair<'_, Rule>, memory: &mut MemoryManager, local_stack: &[Variable], strings: &mut Vec<String>) -> ProgramItem {
     let mut pairs = pair.into_inner();
 
-    let _dest = pairs.next().unwrap();
+    let dest = pairs.next().unwrap();
 
     handle_expression(
         pairs.next().unwrap(),
-        Box::new(ArgumentRegister::R8),
+        memory,
+        ExpressionDestination::Variable(local_stack.iter().find(|lsv| lsv.name == dest.as_str()).expect("Undeclared variable!").to_owned()),
         strings,
-    );
-    todo!()
+    )
 }
 
 #[derive(Debug, Default)]
@@ -476,11 +543,17 @@ struct ExpressionInfo {
     depth: usize,
     pointer_vars: usize,
     stack: Vec<ExpressionInstruction>,
+    memory: MemoryManager,
+    jump_destination: Option<JumpDestination>,
 }
 
 impl ExpressionInfo {
-    fn next_open_memory_location(&mut self) -> Box<dyn Memory> {
-        Box::new(CalleeSavedRegister::Rbx)
+    fn generate_jump_destination(&self) -> JumpDestination {
+        let identifier = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
+        JumpDestination { 
+            then: format!("{}_then", &identifier), 
+            otherwise: Some(format!("{}_else", &identifier)) 
+        }
     }
 }
 
@@ -491,21 +564,51 @@ struct ExpressionInstruction {
     arg2: Operand,
 }
 
+impl ExpressionInstruction {
+    fn write<W: Write>(self, writer: &mut W) -> Result<(), std::io::Error> {
+        self.op.write(writer, self.arg1, self.arg2)
+    }
+}
+
 #[derive(Debug)]
 enum Operand {
-    Register(Box<dyn Memory>),
+    Memory(Box<dyn Memory>),
     Global(String),
     StringConstant(usize),
     IntegerConstant(i64),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Operation {
     Add,
     Sub,
     Mult,
     Div,
     Mod,
+    Mov,
+    CmpJmp {
+        op: ComparisonOperation,
+        store: Box<dyn Memory>,
+        dest: JumpDestination,
+    }
+}
+
+impl Operation {
+    fn write<W: Write>(self, writer: &mut W, arg1: Operand, arg2: Operand) -> Result<(), std::io::Error> {
+        match self {
+            Operation::Add => todo!(),
+            Operation::Sub => todo!(),
+            Operation::Mult => todo!(),
+            Operation::Div => todo!(),
+            Operation::Mod => todo!(),
+            Operation::Mov => todo!(),
+            Operation::CmpJmp { op, store, dest } => todo!(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ComparisonOperation {
     And,
     Or,
     Eq,
@@ -514,21 +617,32 @@ enum Operation {
     Lt,
     Gte,
     Lte,
-    Mov,
+}
+
+#[derive(Debug, Clone)]
+struct JumpDestination {
+    then: String,
+    otherwise: Option<String>,
 }
 
 fn handle_expression(
     pair: Pair<'_, Rule>,
-    destination: Box<dyn Memory>,
+    memory: &MemoryManager,
+    // Where to try to jump if a JMP operation is necessary and succeeds
+    destination: ExpressionDestination,
     strings: &mut Vec<String>,
 ) -> ProgramItem {
-    let mut expr_info = ExpressionInfo::default();
+    let jump_destination = match &destination {
+        ExpressionDestination::Variable(_) => None,
+        ExpressionDestination::ConditionalJump(jd) => Some(jd.to_owned()),
+    };
+
+    let mut expr_info = ExpressionInfo { memory: *memory, jump_destination, ..ExpressionInfo::default() };
     let expr = build_expression_stack(pair.into_inner().next().unwrap(), &mut expr_info, strings);
     println!("INFO: {:#?}", expr_info);
     println!("TARGET: {:#?}", expr);
 
-    // ProgramItem::Expression { inner: expr, target: destination }
-    todo!()
+    ProgramItem::Expression { stack: expr_info.stack, output: expr, destination }
 }
 
 fn build_expression_stack(
@@ -538,8 +652,8 @@ fn build_expression_stack(
 ) -> Box<dyn Memory> {
     match pair.as_rule() {
         Rule::primary_expr => handle_primary_expression(pair, info, strings),
-        Rule::logical_or_expr => variadic_expression_helper(pair, info, strings, Operation::Or),
-        Rule::logical_and_expr => variadic_expression_helper(pair, info, strings, Operation::And),
+        Rule::logical_or_expr => variadic_expression_helper(pair, info, strings, ComparisonOperation::Or),
+        Rule::logical_and_expr => variadic_expression_helper(pair, info, strings, ComparisonOperation::And),
         Rule::equality_expr => eq_or_rel_expression_helper(pair, info, strings),
         Rule::relational_expr => eq_or_rel_expression_helper(pair, info, strings),
         Rule::additive_expr => four_function_variadic_expression_helper(pair, info, strings),
@@ -563,20 +677,20 @@ fn handle_primary_expression(
                     // Assuming nothing stupid is going on here,
                     // I should just be able to assume that the string is the only thing in the expression
                     strings.push(lit.as_str().to_string());
-                    let next_loc = info.next_open_memory_location();
+                    let next_loc = info.memory.next_free_memory();
                     info.stack.push(ExpressionInstruction {
                         op: Operation::Mov,
                         arg1: Operand::StringConstant(strings.len() - 1),
-                        arg2: Operand::Register(dyn_clone::clone_box(next_loc.as_ref())),
+                        arg2: Operand::Memory(dyn_clone::clone_box(next_loc.as_ref())),
                     });
                     next_loc
                 }
                 Rule::integer => {
-                    let next_loc = info.next_open_memory_location();
+                    let next_loc = info.memory.next_free_memory();
                     info.stack.push(ExpressionInstruction {
                         op: Operation::Mov,
                         arg1: Operand::IntegerConstant(lit.as_str().trim().parse().unwrap()),
-                        arg2: Operand::Register(dyn_clone::clone_box(next_loc.as_ref())),
+                        arg2: Operand::Memory(dyn_clone::clone_box(next_loc.as_ref())),
                     });
                     next_loc
                 }
@@ -608,6 +722,7 @@ fn four_function_variadic_expression_helper(
     todo!()
 }
 
+/// This function requires that some JMP instruction exists, otherwise it creates one itself
 fn eq_or_rel_expression_helper(
     pair: Pair<'_, Rule>,
     info: &mut ExpressionInfo,
@@ -627,7 +742,7 @@ fn variadic_expression_helper(
     pair: Pair<'_, Rule>,
     info: &mut ExpressionInfo,
     strings: &mut Vec<String>,
-    op: Operation,
+    op: ComparisonOperation,
 ) -> Box<dyn Memory> {
     let mut pairs = pair.into_inner();
     if pairs.len() == 1 {
@@ -641,14 +756,25 @@ fn variadic_expression_helper(
         ops.push_back(build_expression_stack(ops_item, info, strings));
     }
 
-    let result_reg = ops.pop_front().unwrap();
-    for op_mem in ops {
+    let mut comparison_register = ops.pop_back().unwrap();
+    while let Some(op_mem) = ops.pop_back() {
+        // If needed, allocate a new JMP destination and register to store the result
+        // If this is the last instruction to be generated, then take the one out of `info` if it exists
+        let dest = if !ops.is_empty() {
+            info.generate_jump_destination()
+        } else {
+            info.jump_destination.take().unwrap_or_else(|| info.generate_jump_destination())
+        };
+        let next_result = info.memory.next_free_memory();
+
         info.stack.push(ExpressionInstruction {
-            op,
-            arg1: Operand::Register(op_mem),
-            arg2: Operand::Register(dyn_clone::clone_box(result_reg.as_ref())),
-        })
+            op: Operation::CmpJmp { op, store: dyn_clone::clone_box(next_result.as_ref()), dest },
+            arg1: Operand::Memory(op_mem),
+            arg2: Operand::Memory(dyn_clone::clone_box(comparison_register.as_ref())),
+        });
+
+        comparison_register = next_result;
     }
 
-    result_reg
+    comparison_register
 }

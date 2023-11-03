@@ -10,3 +10,4 @@ clap = { version = "4.4.7", features = ["derive"] }
 dyn-clone = "1.0.14"
 pest = "2.7.5"
 pest_derive = "2.7.5"
+rand = "0.8.5"
