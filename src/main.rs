@@ -607,7 +607,7 @@ impl Operation {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComparisonOperation {
     And,
     Or,
@@ -637,10 +637,14 @@ fn handle_expression(
         ExpressionDestination::ConditionalJump(jd) => Some(jd.to_owned()),
     };
 
-    let mut expr_info = ExpressionInfo { memory, jump_destination, depth: 0, pointer_vars: 0, stack: vec![]  };
+    let mut expr_info = ExpressionInfo { 
+        memory, 
+        jump_destination, 
+        depth: 0, 
+        pointer_vars: 0, 
+        stack: vec![] 
+    };
     let expr = build_expression_stack(pair.into_inner().next().unwrap(), &mut expr_info, strings);
-    println!("INFO: {:#?}", expr_info);
-    println!("TARGET: {:#?}", expr);
 
     ProgramItem::Expression { stack: expr_info.stack, output: expr, destination }
 }
@@ -785,9 +789,6 @@ fn mathematic_variadic_expression_helper(
         }
     }
 
-    println!("SUBEXPRS: {:#?}", sub_expressions);
-    println!("INFO: {:#?}", info);
-
     fn convert_subexpression_to_operations(info: &mut ExpressionInfo, sub_expression: Box<StackEvaluationStep>) -> Box<dyn Memory> {
         match sub_expression.as_ref() {
             StackEvaluationStep::Memory(memory) => memory.clone(),
@@ -821,7 +822,31 @@ fn eq_or_rel_expression_helper(
 
     info.depth += 1;
 
-    todo!()
+    let left_operand = build_expression_stack(pairs.next().unwrap(), info, strings);
+    let op = match pairs.next().unwrap().as_str() {
+        "==" => ComparisonOperation::Eq,
+        "!=" => ComparisonOperation::Neq,
+        ">" => ComparisonOperation::Gt,
+        "<" => ComparisonOperation::Lt,
+        ">=" => ComparisonOperation::Gte,
+        "<=" => ComparisonOperation::Lte,
+        _ => unreachable!(),
+    };
+    let right_operand = build_expression_stack(pairs.next().unwrap(), info, strings);
+
+    let mem = info.memory.next_free_memory();
+
+    info.stack.push(ExpressionInstruction { 
+        op: Operation::CmpJmp { 
+            op, 
+            store: dyn_clone::clone_box(mem.as_ref()), 
+            dest: info.jump_destination.take().unwrap_or_else(|| info.generate_jump_destination()) 
+        }, 
+        arg1: Operand::Memory(left_operand), 
+        arg2: Operand::Memory(right_operand), 
+    });
+
+    mem
 }
 
 fn variadic_expression_helper(
@@ -842,25 +867,35 @@ fn variadic_expression_helper(
         ops.push_back(build_expression_stack(ops_item, info, strings));
     }
 
-    let mut comparison_register = ops.pop_back().unwrap();
+    // All of these calls should realistically jump to the same place
+    // Result storage will happen regardless of whether it's needed because this is a single-pass compiler
+    let dest= info.jump_destination.take().unwrap_or_else(|| info.generate_jump_destination());
+    let final_result = info.memory.next_free_memory();
+
+    // let mut comparison_register = ops.pop_back().unwrap();
     while let Some(op_mem) = ops.pop_back() {
         // If needed, allocate a new JMP destination and register to store the result
         // If this is the last instruction to be generated, then take the one out of `info` if it exists
-        let dest = if !ops.is_empty() {
-            info.generate_jump_destination()
-        } else {
-            info.jump_destination.take().unwrap_or_else(|| info.generate_jump_destination())
-        };
-        let next_result = info.memory.next_free_memory();
+        // let dest = if !ops.is_empty() {
+        //     info.generate_jump_destination()
+        // } else {
+        //     info.jump_destination.take().unwrap_or_else(|| info.generate_jump_destination())
+        // };
+        // let next_result = info.memory.next_free_memory();
 
         info.stack.push(ExpressionInstruction {
-            op: Operation::CmpJmp { op, store: dyn_clone::clone_box(next_result.as_ref()), dest },
+            op: Operation::CmpJmp { op, store: dyn_clone::clone_box(final_result.as_ref()), dest: dest.clone() },
             arg1: Operand::Memory(op_mem),
-            arg2: Operand::Memory(dyn_clone::clone_box(comparison_register.as_ref())),
+            arg2: if op == ComparisonOperation::And {
+                Operand::IntegerConstant(1)
+            } else {
+                Operand::IntegerConstant(0)
+            },
         });
 
-        comparison_register = next_result;
+        // comparison_register = next_result;
     }
 
-    comparison_register
+    // comparison_register
+    final_result
 }
