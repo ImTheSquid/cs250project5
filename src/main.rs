@@ -538,16 +538,16 @@ fn handle_assignment(pair: Pair<'_, Rule>, memory: &mut MemoryManager, local_sta
     )
 }
 
-#[derive(Debug, Default)]
-struct ExpressionInfo {
+#[derive(Debug)]
+struct ExpressionInfo<'a> {
     depth: usize,
     pointer_vars: usize,
     stack: Vec<ExpressionInstruction>,
-    memory: MemoryManager,
+    memory: &'a mut MemoryManager,
     jump_destination: Option<JumpDestination>,
 }
 
-impl ExpressionInfo {
+impl ExpressionInfo<'_> {
     fn generate_jump_destination(&self) -> JumpDestination {
         let identifier = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
         JumpDestination { 
@@ -627,7 +627,7 @@ struct JumpDestination {
 
 fn handle_expression(
     pair: Pair<'_, Rule>,
-    memory: &MemoryManager,
+    memory: &mut MemoryManager,
     // Where to try to jump if a JMP operation is necessary and succeeds
     destination: ExpressionDestination,
     strings: &mut Vec<String>,
@@ -637,7 +637,7 @@ fn handle_expression(
         ExpressionDestination::ConditionalJump(jd) => Some(jd.to_owned()),
     };
 
-    let mut expr_info = ExpressionInfo { memory: *memory, jump_destination, ..ExpressionInfo::default() };
+    let mut expr_info = ExpressionInfo { memory, jump_destination, depth: 0, pointer_vars: 0, stack: vec![]  };
     let expr = build_expression_stack(pair.into_inner().next().unwrap(), &mut expr_info, strings);
     println!("INFO: {:#?}", expr_info);
     println!("TARGET: {:#?}", expr);
@@ -656,8 +656,8 @@ fn build_expression_stack(
         Rule::logical_and_expr => variadic_expression_helper(pair, info, strings, ComparisonOperation::And),
         Rule::equality_expr => eq_or_rel_expression_helper(pair, info, strings),
         Rule::relational_expr => eq_or_rel_expression_helper(pair, info, strings),
-        Rule::additive_expr => four_function_variadic_expression_helper(pair, info, strings),
-        Rule::multiplicative_expr => four_function_variadic_expression_helper(pair, info, strings),
+        Rule::additive_expr => mathematic_variadic_expression_helper(pair, info, strings),
+        Rule::multiplicative_expr => mathematic_variadic_expression_helper(pair, info, strings),
         _ => unreachable!(),
     }
 }
@@ -707,7 +707,7 @@ fn handle_primary_expression(
     }
 }
 
-fn four_function_variadic_expression_helper(
+fn mathematic_variadic_expression_helper(
     pair: Pair<'_, Rule>,
     info: &mut ExpressionInfo,
     strings: &mut Vec<String>,
@@ -719,7 +719,93 @@ fn four_function_variadic_expression_helper(
 
     info.depth += 1;
 
-    todo!()
+    // Convert the pairs to postfix
+    let pairs = {
+        let mut stack = VecDeque::new();
+        let mut expression = Vec::new();
+
+        fn is_higher_precendence(challenger: Rule, incumbent: Rule) -> bool {
+            match challenger {
+                Rule::mult_type => true,
+                Rule::add_type => matches!(incumbent, Rule::add_type),
+                _ => unreachable!(),
+            }
+        }
+
+        for pair in pairs {
+            match pair.as_rule() {
+                Rule::add_type | Rule::mult_type => {
+                    if stack.back().is_some_and(|last_stack_item: &Pair<'_, Rule>| is_higher_precendence(last_stack_item.as_rule(), pair.as_rule())) {
+                        // New operator has lower precedence, start popping until it doesn't
+                        while stack.back().is_some_and(|last_stack_item: &Pair<'_, Rule>| is_higher_precendence(last_stack_item.as_rule(), pair.as_rule())) {
+                            expression.push(stack.pop_back().unwrap());
+                        }
+
+                        stack.push_back(pair);
+                    } else { // New operator has higher precedence, add it to the stack
+                        stack.push_back(pair);
+                    }
+                },
+                _ => expression.push(pair),
+            }
+        }
+
+        // Empty the stack
+        while let Some(back) = stack.pop_back() {
+            expression.push(back);
+        }
+
+        expression
+    };
+
+    #[derive(Debug, Clone)]
+    enum StackEvaluationStep {
+        Memory(Box<dyn Memory>),
+        Expression(Operation, Box<StackEvaluationStep>, Box<StackEvaluationStep>),
+    }
+
+    // Parse the arguments and symbols
+    let mut sub_expressions = VecDeque::new();
+    for item in pairs {
+        match item.as_rule() {
+            Rule::add_type | Rule::mult_type => {
+                let top = sub_expressions.pop_back().expect("Invalid expression!");
+                let second = sub_expressions.pop_back().expect("Invalid expression!");
+
+                sub_expressions.push_back(StackEvaluationStep::Expression(match item.as_str() {
+                    "*" => Operation::Mult,
+                    "/" => Operation::Div,
+                    "%" => Operation::Mod,
+                    "+" => Operation::Add,
+                    "-" => Operation::Sub,
+                    _ => unreachable!()
+                }, Box::new(second), Box::new(top)));
+            },
+            _ => sub_expressions.push_back(StackEvaluationStep::Memory(build_expression_stack(item, info, strings))),
+        }
+    }
+
+    println!("SUBEXPRS: {:#?}", sub_expressions);
+    println!("INFO: {:#?}", info);
+
+    fn convert_subexpression_to_operations(info: &mut ExpressionInfo, sub_expression: Box<StackEvaluationStep>) -> Box<dyn Memory> {
+        match sub_expression.as_ref() {
+            StackEvaluationStep::Memory(memory) => memory.clone(),
+            StackEvaluationStep::Expression(op, arg1, arg2) => {
+                let arg1 = convert_subexpression_to_operations(info, arg1.clone());
+                let arg2 = convert_subexpression_to_operations(info, arg2.clone());
+
+                info.stack.push(ExpressionInstruction { op: op.to_owned(), arg1: Operand::Memory(arg1), arg2: Operand::Memory(dyn_clone::clone_box(arg2.as_ref())) });
+
+                arg2
+            },
+        }
+    }
+
+    // Convert the subexpressions into expression operations that can be evaluated and written
+    // Using an inside out traversal, this can be done pretty easily
+
+    convert_subexpression_to_operations(info, Box::new(sub_expressions.pop_front().unwrap()))
 }
 
 /// This function requires that some JMP instruction exists, otherwise it creates one itself
