@@ -48,7 +48,7 @@ function_arg = { any_type ~ ident }
 statement_list = { (if_expr | while_expr | do_while_expr | for_expr | flow_control | decl | assignment ~ ";" | call ~ ";")* }
 
 // Dereferencing pointers is not allowed
-assignment = { ident_name ~ "=" ~ expression }
+assignment = { (array_access | ident_name) ~ "=" ~ expression }
 
 call = { ident ~ "(" ~ call_list? ~ ")" }
 

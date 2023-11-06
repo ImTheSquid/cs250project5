@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashSet, VecDeque, HashMap},
     fmt::Debug,
     fs,
     hash::Hash,
@@ -26,21 +26,6 @@ struct Args {
 #[derive(Debug, Parser)]
 #[grammar = "simplec.pest"]
 struct SimpleCParser;
-
-// #[derive(Debug, Clone, Copy)]
-// enum StackRegister {
-//     Rsp,
-//     Rbp,
-// }
-
-// impl ToString for StackRegister {
-//     fn to_string(&self) -> String {
-//         match self {
-//             StackRegister::Rsp => "rsp",
-//             StackRegister::Rbp => "rbp",
-//         }.to_string()
-//     }
-// }
 
 /// Any place you can store to and retrieve from
 /// Examples include Registers, the Stack, and RAM
@@ -94,13 +79,13 @@ struct StackAllocation {
 
 impl ToString for StackAllocation {
     fn to_string(&self) -> String {
-        todo!()
+        format!("-{}(%rbx)", self.offset)
     }
 }
 
 impl Memory for StackAllocation {
     fn is_register(&self) -> bool {
-        true
+        false
     }
 }
 
@@ -143,6 +128,26 @@ impl ToString for ArgumentRegister {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum UtilRegister {
+    Rax,
+}
+
+impl Memory for UtilRegister {
+    fn is_register(&self) -> bool {
+        true
+    }
+}
+
+impl ToString for UtilRegister {
+    fn to_string(&self) -> String {
+        match self {
+            Self::Rax => "%rax"
+        }
+        .to_string()
+    }
+}
+
 #[derive(Debug)]
 enum ProgramItem {
     /// Generates a global with a name
@@ -151,15 +156,12 @@ enum ProgramItem {
     Function {
         name: String,
         args: HashSet<String>,
+        stack_allocs: usize,
         children: Vec<ProgramItem>,
     },
     FunctionCall {
         name: String,
         args: Vec<ProgramItem>,
-    },
-    StringLiteralLoad {
-        id: usize,
-        target: Box<dyn Memory>,
     },
     Expression {
         stack: Vec<ExpressionInstruction>,
@@ -167,30 +169,6 @@ enum ProgramItem {
         destination: ExpressionDestination,
     },
 }
-
-// #[derive(Debug)]
-// enum Expression {
-//     Variable(Variable),
-//     ArrayAccess {
-//         variable: Variable,
-//         offset: Box<Expression>,
-//     },
-//     StringConstant(usize),
-//     IntegerConstant(i64),
-//     Product(Vec<Expression>),
-//     Sum(Vec<Expression>),
-//     Difference(Vec<Expression>),
-//     Quotient(Vec<Expression>),
-//     Modulus(Vec<Expression>),
-//     LogicalAnd(Vec<Expression>),
-//     LogicalOr(Vec<Expression>),
-//     Equal(Box<Expression>, Box<Expression>),
-//     NotEqual(Box<Expression>, Box<Expression>),
-//     Greater(Box<Expression>, Box<Expression>),
-//     Less(Box<Expression>, Box<Expression>),
-//     GreaterEq(Box<Expression>, Box<Expression>),
-//     LessEq(Box<Expression>, Box<Expression>),
-// }
 
 impl ProgramItem {
     fn write<W: Write>(self, writer: &mut W) -> Result<(), std::io::Error> {
@@ -201,6 +179,7 @@ impl ProgramItem {
             ProgramItem::Function {
                 name,
                 args,
+                stack_allocs,
                 children,
             } => {
                 // Header
@@ -223,9 +202,29 @@ impl ProgramItem {
                     writer.write_all(format!("\tpushq {}\n", register.to_string()).as_bytes())?;
                 }
 
+                // Make sure stack is aligned to 16 bytes
+                let stack_allocs = if stack_allocs % 2 == 0 {
+                    stack_allocs
+                } else {
+                    stack_allocs + 1
+                };
+
+                if stack_allocs > 0 {
+                    writer.write_all("\txorq %r15, %r15\n".as_bytes())?;
+                    for _ in 0..stack_allocs {
+                        writer.write_all("\tpushq %r15\n".as_bytes())?;
+                    }
+                }
+
                 // Content
                 for child in children {
                     child.write(writer)?;
+                }
+
+                if stack_allocs > 0 {
+                    for _ in 0..stack_allocs {
+                        writer.write_all("\tpopq %r15\n".as_bytes())?;
+                    }
                 }
 
                 // Restore registers
@@ -256,16 +255,44 @@ impl ProgramItem {
                 writer.write_all(format!("call {name}\n").as_bytes())?;
 
                 Ok(())
-            }
-            Self::StringLiteralLoad { id, target } => {
-                writer.write_all(
-                    format!("\tmovq $global_string_{id}, {}", target.to_string()).as_bytes(),
-                )?;
-
-                Ok(())
-            }
+            },
             Self::Expression { stack, output, destination } => {
-                println!("expression writing is hard");
+                println!("expression writing is hard ================================");
+                println!("STACK: {:#?}", stack);
+                println!("OUTPUT: {}", output.to_string());
+                println!("DESTINATION: {:#?}", destination);
+
+                for instruction in stack {
+                    instruction.write(writer)?;
+                }
+
+                match destination {
+                    ExpressionDestination::Variable(v) => match v.location {
+                        RealizedVariableLocation::Memory(m) => {
+                            if !output.is_register() && !m.is_register() {
+                                writer.write_all(format!("\tmovq {}, %r15\n", output.to_string()).as_bytes())?;
+                                writer.write_all(format!("\tmovq %r15, {}", m.to_string()).as_bytes())?;
+                            } else {
+                                writer.write_all(format!("\tmovq {}, {}\n", output.to_string(), m.to_string()).as_bytes())?;
+                            }
+                        },
+                        RealizedVariableLocation::Global(g) => {
+                            let (output, flag): (Box<dyn Memory>, bool) = if !output.is_register() {
+                                writer.write_all(format!("\tpushq %r14\n\tmovq {}, %r14", output.to_string()).as_bytes())?;
+                                (Box::new(CalleeSavedRegister::R14), true)
+                            } else {
+                                (output, false)
+                            };
+
+                            writer.write_all(format!("\tmovq ${g}, %r15\n\tmovq {}, (%r15)\n", output.to_string()).as_bytes())?;
+
+                            if flag {
+                                writer.write_all("\tpopq %r14".as_bytes())?;
+                            }
+                        },
+                    },
+                    ExpressionDestination::ConditionalJump(_) => todo!(),
+                }
 
                 Ok(())
             },
@@ -336,13 +363,13 @@ fn main() {
 }
 
 /// Handle potentially multiple globals
-fn handle_global_decl(pair: Pair<'_, Rule>, globals: &mut HashSet<Variable>) -> Vec<ProgramItem> {
+fn handle_global_decl(pair: Pair<'_, Rule>, globals: &mut HashSet<String>) -> Vec<ProgramItem> {
     let mut pairs = pair.into_inner();
-    let ty = pairs.next().unwrap().into_inner();
+    let _ty = pairs.next().unwrap().into_inner();
 
-    let num_indirection = ty
-        .filter(|pair| matches!(pair.as_rule(), Rule::pointer))
-        .count();
+    // let num_indirection = ty
+    //     .filter(|pair| matches!(pair.as_rule(), Rule::pointer))
+    //     .count();
 
     let decl_ident_list = pairs.next().unwrap();
 
@@ -351,17 +378,14 @@ fn handle_global_decl(pair: Pair<'_, Rule>, globals: &mut HashSet<Variable>) -> 
         .map(|ident| {
             let ident = ident.as_str().to_string();
 
-            if globals.iter().any(|g| g.name == ident.as_str()) {
+            if globals.iter().any(|g| g == ident.as_str()) {
                 panic!(
                     "Variable redeclaration error! Variable `{}` is defined more than once.",
                     ident.as_str()
                 );
             }
 
-            globals.insert(Variable {
-                name: ident.clone(),
-                indirection: num_indirection,
-            });
+            globals.insert(ident.clone());
 
             ProgramItem::Global(ident)
         })
@@ -395,28 +419,21 @@ impl MemoryManager {
 }
 
 #[derive(Debug, Clone)]
-struct Variable {
-    name: String,
-    indirection: usize,
+enum RealizedVariableLocation {
+    Memory(Box<dyn Memory>),
+    Global(String),
 }
 
-impl Eq for Variable {}
-
-impl PartialEq for Variable {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-    }
-}
-
-impl Hash for Variable {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
-    }
+/// The regular variable doesn't take into account where things are placed in generated assembly, so this does
+#[derive(Debug, Clone)]
+struct RealizedVariable {
+    location: RealizedVariableLocation,
+    offset: Option<usize>,
 }
 
 fn handle_function(
     pair: Pair<'_, Rule>,
-    globals: &HashSet<Variable>,
+    globals: &HashSet<String>,
     strings: &mut Vec<String>,
 ) -> ProgramItem {
     let mut pairs = pair.into_inner();
@@ -455,7 +472,7 @@ fn handle_function(
         pairs.next()
     };
 
-    let mut local_stack = Vec::<Variable>::new();
+    let mut local_stack = HashMap::<String, Box<dyn Memory>>::new();
     let mut memory = MemoryManager::default();
 
     // Function may not have a body
@@ -464,11 +481,11 @@ fn handle_function(
             .into_inner()
             .flat_map(|statement| match statement.as_rule() {
                 Rule::decl => {
-                    handle_local_decl(statement, &mut local_stack, globals);
+                    handle_local_decl(statement, &mut memory, &mut local_stack, globals);
                     vec![]
                 }
-                Rule::assignment => vec![handle_assignment(statement, &mut memory, &local_stack, strings)],
-                Rule::call => todo!(),
+                Rule::assignment => vec![handle_assignment(statement, &mut memory, &local_stack, globals, strings)],
+                Rule::call => vec![handle_function_call(statement)],
                 Rule::if_expr => todo!(),
                 Rule::while_expr => todo!(),
                 Rule::do_while_expr => todo!(),
@@ -484,27 +501,35 @@ fn handle_function(
     ProgramItem::Function {
         name: ident.to_string(),
         args: arg_list_str,
+        stack_allocs: memory.stack_allocs,
         children,
     }
 }
 
+fn handle_function_call(
+    pair: Pair<'_, Rule>
+) -> ProgramItem {
+    todo!()
+}
+
 fn handle_local_decl(
     pair: Pair<'_, Rule>,
-    local_stack: &mut Vec<Variable>,
-    globals: &HashSet<Variable>,
+    memory: &mut MemoryManager,
+    local_stack: &mut HashMap<String, Box<dyn Memory>>,
+    globals: &HashSet<String>,
 ) {
     let mut pairs = pair.into_inner();
-    let ty = pairs.next().unwrap().into_inner();
+    let _ty = pairs.next().unwrap().into_inner();
 
-    let num_indirection = ty
-        .filter(|pair| matches!(pair.as_rule(), Rule::pointer))
-        .count();
+    // let num_indirection = ty
+    //     .filter(|pair| matches!(pair.as_rule(), Rule::pointer))
+    //     .count();
 
     let decl_ident_list = pairs.next().unwrap();
 
     for ident in decl_ident_list.into_inner() {
-        if globals.iter().any(|g| g.name == ident.as_str())
-            || local_stack.iter().any(|l| l.name == ident.as_str())
+        if globals.iter().any(|g| g == ident.as_str())
+            || local_stack.iter().any(|(l, _)| l == ident.as_str())
         {
             panic!(
                 "Variable redeclaration error! Variable `{}` is defined more than once.",
@@ -512,28 +537,40 @@ fn handle_local_decl(
             );
         }
 
-        local_stack.push(Variable {
-            name: ident.as_str().to_string(),
-            indirection: num_indirection,
-        })
+        local_stack.insert(ident.as_str().to_string(), memory.next_free_memory());
     }
 }
 
 #[derive(Debug)]
 enum ExpressionDestination {
-    Variable(Variable),
+    Variable(RealizedVariable),
     ConditionalJump(JumpDestination)
 }
 
-fn handle_assignment(pair: Pair<'_, Rule>, memory: &mut MemoryManager, local_stack: &[Variable], strings: &mut Vec<String>) -> ProgramItem {
+fn handle_assignment(pair: Pair<'_, Rule>, memory: &mut MemoryManager, local_stack: &HashMap<String, Box<dyn Memory>>, globals: &HashSet<String>, strings: &mut Vec<String>) -> ProgramItem {
     let mut pairs = pair.into_inner();
 
     let dest = pairs.next().unwrap();
 
+    let rv = match dest.as_rule() {
+        Rule::array_access => {
+            todo!()
+        },
+        Rule::ident_name => {
+            RealizedVariable {
+                location: local_stack.iter().find(|(lsv, _)| lsv.as_str() == dest.as_str().trim()).map(|(v, m)| RealizedVariableLocation::Memory(m.to_owned()))
+                    .or_else(|| globals.iter().find(|g| g.as_str() == dest.as_str().trim()).map(|g| RealizedVariableLocation::Global(g.to_owned())))
+                    .expect("Undeclared variable!"),
+                offset: None,
+            }
+        },
+        _ => unreachable!(),
+    };
+
     handle_expression(
         pairs.next().unwrap(),
         memory,
-        ExpressionDestination::Variable(local_stack.iter().find(|lsv| lsv.name == dest.as_str()).expect("Undeclared variable!").to_owned()),
+        ExpressionDestination::Variable(rv),
         strings,
     )
 }
@@ -551,7 +588,7 @@ impl ExpressionInfo<'_> {
     fn generate_jump_destination(&self) -> JumpDestination {
         let identifier = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
         JumpDestination { 
-            then: format!("{}_then", &identifier), 
+            then: Some(format!("{}_then", &identifier)), 
             otherwise: Some(format!("{}_else", &identifier)) 
         }
     }
@@ -573,9 +610,26 @@ impl ExpressionInstruction {
 #[derive(Debug)]
 enum Operand {
     Memory(Box<dyn Memory>),
+    OffsetMemory(Box<dyn Memory>, usize),
     Global(String),
     StringConstant(usize),
     IntegerConstant(i64),
+}
+
+impl ToString for Operand {
+    fn to_string(&self) -> String {
+        match self {
+            Operand::Memory(m) => m.to_string(),
+            Operand::OffsetMemory(m, o) => if m.is_register() {
+                format!("-{o}({})", m.to_string())
+            } else {
+                format!("-{o}{}", m.to_string())
+            },
+            Operand::Global(name) => format!("${name}"),
+            Operand::StringConstant(i) => format!("$global_string_{i}"),
+            Operand::IntegerConstant(i) => format!("${i}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -595,15 +649,76 @@ enum Operation {
 
 impl Operation {
     fn write<W: Write>(self, writer: &mut W, arg1: Operand, arg2: Operand) -> Result<(), std::io::Error> {
+        // The multiplication operations already use RAX for the operation, therefore they have a temp register built-in and don't need another temp
+        let arg1 = if matches!(self, Operation::Div | Operation::Mod | Operation::Mult) {
+            arg1
+        } else {
+            write_temp_register_if_needed(writer, arg1, &arg2)?
+        };
+
         match self {
-            Operation::Add => todo!(),
-            Operation::Sub => todo!(),
-            Operation::Mult => todo!(),
-            Operation::Div => todo!(),
-            Operation::Mod => todo!(),
-            Operation::Mov => todo!(),
+            Operation::Add => writer.write_all(format!("\taddq {}, {}\n", arg1.to_string(), arg2.to_string()).as_bytes()),
+            Operation::Sub => writer.write_all(format!("\tsubq {}, {}\n", arg1.to_string(), arg2.to_string()).as_bytes()),
+            Operation::Mult => {
+                writer.write_all(format!("\tmovq {}, %rax\n\tcqo\n", arg1.to_string()).as_bytes())?;
+                writer.write_all(format!("\timulq {}\n", arg2.to_string()).as_bytes())?;
+                writer.write_all(format!("\tmovq %rax, {}\n", arg2.to_string()).as_bytes())?;
+
+                Ok(())
+            },
+            Operation::Div => {
+                writer.write_all(format!("\tmovq {}, %rax\n\tcqo\n", arg1.to_string()).as_bytes())?;
+                writer.write_all(format!("\tidivq {}\n", arg2.to_string()).as_bytes())?;
+                writer.write_all(format!("\tmovq %rax, {}\n", arg2.to_string()).as_bytes())?;
+
+                Ok(())
+            },
+            Operation::Mod => {
+                writer.write_all(format!("\tmovq {}, %rax\n\tcqo\n", arg1.to_string()).as_bytes())?;
+                writer.write_all(format!("\tidivq {}\n", arg2.to_string()).as_bytes())?;
+                writer.write_all(format!("\tmovq %rax, {}\n", arg2.to_string()).as_bytes())?;
+
+                Ok(())
+            },
+            Operation::Mov => writer.write_all(format!("\tmovq {}, {}\n", arg1.to_string(), arg2.to_string()).as_bytes()),
             Operation::CmpJmp { op, store, dest } => todo!(),
         }
+    }
+}
+
+/// In case an instruction ends up needing multiple references (like `imulq -8(%rbx), -16(%rbx)`), 
+/// this will temporarily transfer the first value into %r15 (the SOURCE operand)
+fn write_temp_register_if_needed<W: Write>(writer: &mut W, arg1: Operand, arg2: &Operand) -> Result<Operand, std::io::Error> {
+    match arg1 {
+        Operand::Memory(_) => {
+            match arg2 {
+                Operand::Memory(m2) | Operand::OffsetMemory(m2, _) => {
+                    if m2.is_register() {
+                        return Ok(arg1);
+                    }
+
+                    writer.write_all(format!("\tmovq {}, %r15\n", arg1.to_string()).as_bytes())?;
+
+                    Ok(Operand::Memory(Box::new(CalleeSavedRegister::R15)))
+                },
+                _ => Ok(arg1),
+            }
+        },
+        Operand::OffsetMemory(_, _) => {
+            match arg2 {
+                Operand::Memory(m2) | Operand::OffsetMemory(m2, _) => {
+                    if m2.is_register() {
+                        return Ok(arg1);
+                    }
+
+                    writer.write_all(format!("\tmovq {}, %r15\n", arg1.to_string()).as_bytes())?;
+
+                    Ok(Operand::Memory(Box::new(CalleeSavedRegister::R15)))
+                },
+                _ => Ok(arg1),
+            }
+        },
+        _ => Ok(arg1)
     }
 }
 
@@ -621,7 +736,7 @@ enum ComparisonOperation {
 
 #[derive(Debug, Clone)]
 struct JumpDestination {
-    then: String,
+    then: Option<String>,
     otherwise: Option<String>,
 }
 
@@ -701,7 +816,19 @@ fn handle_primary_expression(
                 _ => unreachable!(),
             }
         }
-        Rule::call => todo!(),
+        Rule::call => {
+            handle_function_call(pair);
+
+            let dest = info.memory.next_free_memory();
+
+            info.stack.push(ExpressionInstruction { 
+                op: Operation::Mov, 
+                arg1: Operand::Memory(Box::new(UtilRegister::Rax)), 
+                arg2: Operand::Memory(dyn_clone::clone_box(dest.as_ref())),
+            });
+
+            dest
+        },
         Rule::array_access => todo!(),
         Rule::expression => {
             build_expression_stack(pair.into_inner().next().unwrap(), info, strings)
