@@ -214,10 +214,11 @@ impl ProgramItem {
                 } - 6;
 
                 if stack_allocs > 0 {
-                    writer.write_all("\txorq %r15, %r15\n".as_bytes())?;
-                    for _ in 0..stack_allocs {
-                        writer.write_all("\tpushq %r15\n".as_bytes())?;
-                    }
+                    writer.write_all(format!("\tsubq ${}, %rsp\n", stack_allocs * 8).as_bytes())?;
+                    // writer.write_all("\txorq %r15, %r15\n".as_bytes())?;
+                    // for _ in 0..stack_allocs {
+                    //     writer.write_all("\tpushq %r15\n".as_bytes())?;
+                    // }
                 }
 
                 // Args
@@ -237,9 +238,10 @@ impl ProgramItem {
                 writer.write_all(format!("__{name}_exit:\n").as_bytes())?;
 
                 if stack_allocs > 0 {
-                    for _ in 0..stack_allocs {
-                        writer.write_all("\tpopq %r15\n".as_bytes())?;
-                    }
+                    // for _ in 0..stack_allocs {
+                    //     writer.write_all("\tpopq %r15\n".as_bytes())?;
+                    // }
+                    writer.write_all(format!("\taddq ${}, %rsp\n", stack_allocs * 8).as_bytes())?;
                 }
 
                 // Restore registers
