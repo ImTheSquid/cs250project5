@@ -171,7 +171,7 @@ enum ProgramItem {
     Return {
         name: String,
         value: Vec<ProgramItem>,
-    }
+    },
 }
 
 impl ProgramItem {
@@ -222,7 +222,10 @@ impl ProgramItem {
 
                 // Args
                 for (arg_dest, reg) in arg_destinations.into_iter().zip(ARGUMENT_REGISTERS) {
-                    writer.write_all(format!("\tmovq {}, {}\n", reg.to_string(), arg_dest.to_string()).as_bytes())?;
+                    writer.write_all(
+                        format!("\tmovq {}, {}\n", reg.to_string(), arg_dest.to_string())
+                            .as_bytes(),
+                    )?;
                 }
 
                 // Content
@@ -258,7 +261,9 @@ impl ProgramItem {
 
                 for (src, reg) in args.into_iter().zip(ARGUMENT_REGISTERS) {
                     // writer.write_all(format!("\tmovq %{} %{}\n", src.to_string(), dest.to_string()).as_bytes())?;
-                    writer.write_all(format!("\tmovq {}, {}\n", src.to_string(), reg.to_string()).as_bytes())?;
+                    writer.write_all(
+                        format!("\tmovq {}, {}\n", src.to_string(), reg.to_string()).as_bytes(),
+                    )?;
                 }
 
                 // Safety for variadics if called
@@ -325,7 +330,7 @@ impl ProgramItem {
                 }
 
                 Ok(())
-            },
+            }
             Self::Return { name, value } => {
                 if value.is_empty() {
                     // Return 0
@@ -339,7 +344,7 @@ impl ProgramItem {
                 writer.write_all(format!("\tjmp __{}_exit\n", name).as_bytes())?;
 
                 Ok(())
-            },
+            }
         }
     }
 }
@@ -372,7 +377,11 @@ fn main() {
     let program = parsed.into_iter().next().unwrap();
 
     let c_file_with_assembly_suffix = {
-        let mut file = args.file.split('.').map(|s| s.to_owned()).collect::<Vec<_>>();
+        let mut file = args
+            .file
+            .split('.')
+            .map(|s| s.to_owned())
+            .collect::<Vec<_>>();
         let _ = file.pop();
         file.push("s".to_string());
         file.join(".")
@@ -451,7 +460,10 @@ struct MemoryManager {
 
 impl Default for MemoryManager {
     fn default() -> Self {
-        Self { register_allocs: 0, stack_allocs: 6 }
+        Self {
+            register_allocs: 0,
+            stack_allocs: 6,
+        }
     }
 }
 
@@ -464,16 +476,6 @@ impl MemoryManager {
             self.stack_allocs += 1;
             Box::new(StackAllocation {
                 offset: 8 * (self.stack_allocs - 1),
-            })
-        }
-    }
-
-    fn memory_from_position(&self, position: usize) -> Box<dyn Memory> {
-        if position < 4 {
-            Box::new(REGISTER_STACK[position])
-        } else {
-            Box::new(StackAllocation {
-                offset: 8 * (position - 4),
             })
         }
     }
@@ -552,14 +554,12 @@ fn handle_function(
                     handle_local_decl(statement, &mut memory, &mut local_stack, globals);
                     vec![]
                 }
-                Rule::assignment => handle_assignment(
-                    statement,
-                    &mut memory,
-                    &local_stack,
-                    globals,
-                    strings,
-                ),
-                Rule::call => handle_function_call(statement, &mut memory, &local_stack, globals, strings),
+                Rule::assignment => {
+                    handle_assignment(statement, &mut memory, &local_stack, globals, strings)
+                }
+                Rule::call => {
+                    handle_function_call(statement, &mut memory, &local_stack, globals, strings)
+                }
                 Rule::if_expr => todo!(),
                 Rule::while_expr => todo!(),
                 Rule::do_while_expr => todo!(),
@@ -568,10 +568,27 @@ fn handle_function(
                     // continue and return are not allowed in the outermost scope, so this has to be a return
                     let flow_control = statement.into_inner().next().unwrap().into_inner().next();
 
-                    vec![
-                        ProgramItem::Return { name: ident.to_string(), value: flow_control.map(|p| handle_expression(p, &mut memory, &local_stack, globals, ExpressionDestination::Variable(RealizedVariable { location: RealizedVariableLocation::Memory(Box::new(UtilRegister::Rax)), offset: None }), strings)).unwrap_or_default() }
-                    ]
-                },
+                    vec![ProgramItem::Return {
+                        name: ident.to_string(),
+                        value: flow_control
+                            .map(|p| {
+                                handle_expression(
+                                    p,
+                                    &mut memory,
+                                    &local_stack,
+                                    globals,
+                                    ExpressionDestination::Variable(RealizedVariable {
+                                        location: RealizedVariableLocation::Memory(Box::new(
+                                            UtilRegister::Rax,
+                                        )),
+                                        offset: None,
+                                    }),
+                                    strings,
+                                )
+                            })
+                            .unwrap_or_default(),
+                    }]
+                }
                 _ => unreachable!(),
             })
             .collect()
@@ -587,7 +604,13 @@ fn handle_function(
     }
 }
 
-fn handle_function_call(pair: Pair<'_, Rule>, memory: &mut MemoryManager, local_stack: &HashMap<String, Box<dyn Memory>>, globals: &HashSet<String>, strings: &mut Vec<String>) -> Vec<ProgramItem> {
+fn handle_function_call(
+    pair: Pair<'_, Rule>,
+    memory: &mut MemoryManager,
+    local_stack: &HashMap<String, Box<dyn Memory>>,
+    globals: &HashSet<String>,
+    strings: &mut Vec<String>,
+) -> Vec<ProgramItem> {
     let mut pairs = pair.into_inner();
 
     let ident = pairs.next().unwrap();
@@ -598,11 +621,29 @@ fn handle_function_call(pair: Pair<'_, Rule>, memory: &mut MemoryManager, local_
 
     let args = pairs.next().unwrap().into_inner();
 
-    let mems= (0..args.len()).map(|_| memory.next_free_memory()).collect::<Vec<_>>();
+    let mems = (0..args.len())
+        .map(|_| memory.next_free_memory())
+        .collect::<Vec<_>>();
 
-    args.zip(mems.clone()).flat_map(|(arg, mem)| {
-        handle_expression(arg.into_inner().next().unwrap(), memory, local_stack, globals, ExpressionDestination::Variable(RealizedVariable { location: RealizedVariableLocation::Memory(mem.to_owned()), offset: None }), strings)
-    }).chain(vec![ProgramItem::FunctionCall { name: ident.as_str().to_owned(), args: mems }]).collect()
+    args.zip(mems.clone())
+        .flat_map(|(arg, mem)| {
+            handle_expression(
+                arg.into_inner().next().unwrap(),
+                memory,
+                local_stack,
+                globals,
+                ExpressionDestination::Variable(RealizedVariable {
+                    location: RealizedVariableLocation::Memory(mem.to_owned()),
+                    offset: None,
+                }),
+                strings,
+            )
+        })
+        .chain(vec![ProgramItem::FunctionCall {
+            name: ident.as_str().to_owned(),
+            args: mems,
+        }])
+        .collect()
 }
 
 fn handle_local_decl(
@@ -685,7 +726,6 @@ fn handle_assignment(
 #[derive(Debug)]
 struct ExpressionInfo<'a> {
     depth: usize,
-    pointer_vars: usize,
     stack: Vec<ExpressionInstruction>,
     memory: &'a mut MemoryManager,
     jump_destination: Option<JumpDestination>,
@@ -696,8 +736,9 @@ impl ExpressionInfo<'_> {
     fn generate_jump_destination(&self) -> JumpDestination {
         let identifier = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
         JumpDestination {
-            then: Some(format!("{}_then", &identifier)),
-            otherwise: Some(format!("{}_else", &identifier)),
+            then: Some(format!("__{}_then", &identifier)),
+            otherwise: Some(format!("__{}_else", &identifier)),
+            end: format!("__{}_end", &identifier),
         }
     }
 }
@@ -784,7 +825,7 @@ impl Operation {
                 writer.write_all(format!("\tnegq {}\n", arg2.to_string()).as_bytes())?;
 
                 Ok(())
-            },
+            }
             Operation::Mult => {
                 writer
                     .write_all(format!("\tmovq {}, %rax\n\tcqo\n", arg1.to_string()).as_bytes())?;
@@ -812,7 +853,33 @@ impl Operation {
             Operation::Mov => writer.write_all(
                 format!("\tmovq {}, {}\n", arg1.to_string(), arg2.to_string()).as_bytes(),
             ),
-            Operation::CmpJmp { op, store, dest } => todo!(),
+            Operation::CmpJmp { op, store, dest } => {
+                writer.write_all(
+                    format!("\tcmpq {}, {}\n", arg1.to_string(), arg2.to_string()).as_bytes(),
+                )?;
+
+                let jump_type = match op {
+                    ComparisonOperation::And => todo!(),
+                    ComparisonOperation::Or => todo!(),
+                    ComparisonOperation::Eq => "jz",
+                    ComparisonOperation::Neq => "jnz",
+                    ComparisonOperation::Gt => "jg",
+                    ComparisonOperation::Lt => "jl",
+                    ComparisonOperation::Gte => "jge",
+                    ComparisonOperation::Lte => "jle",
+                };
+
+                if let Some(then) = &dest.then {
+                    writer.write_all(format!("\t{jump_type} {then}\n").as_bytes())?;
+                }
+
+                if let Some(otherwise) = &dest.then {
+                    writer.write_all(format!("\tjmp {otherwise}\n").as_bytes())?;
+                } else {
+                }
+
+                todo!()
+            }
         }
     }
 }
@@ -869,6 +936,7 @@ enum ComparisonOperation {
 struct JumpDestination {
     then: Option<String>,
     otherwise: Option<String>,
+    end: String,
 }
 
 fn handle_expression(
@@ -889,21 +957,26 @@ fn handle_expression(
         memory,
         jump_destination,
         depth: 0,
-        pointer_vars: 0,
         stack: vec![],
         pre_execution_code: vec![],
     };
-    let expr = build_expression_stack(pair.into_inner().next().unwrap(), &mut expr_info, local_stack, globals, strings);
+    let expr = build_expression_stack(
+        pair.into_inner().next().unwrap(),
+        &mut expr_info,
+        local_stack,
+        globals,
+        strings,
+    );
 
-    println!("{:#?}", expr_info);
-
-    expr_info.pre_execution_code.into_iter().chain(vec![
-        ProgramItem::Expression {
+    expr_info
+        .pre_execution_code
+        .into_iter()
+        .chain(vec![ProgramItem::Expression {
             stack: expr_info.stack,
             output: expr,
             destination,
-        }
-    ]).collect()
+        }])
+        .collect()
 }
 
 fn build_expression_stack(
@@ -915,16 +988,34 @@ fn build_expression_stack(
 ) -> Box<dyn Memory> {
     match pair.as_rule() {
         Rule::primary_expr => handle_primary_expression(pair, info, local_stack, globals, strings),
-        Rule::logical_or_expr => {
-            variadic_expression_helper(pair, info, local_stack, globals, strings, ComparisonOperation::Or)
+        Rule::logical_or_expr => variadic_expression_helper(
+            pair,
+            info,
+            local_stack,
+            globals,
+            strings,
+            ComparisonOperation::Or,
+        ),
+        Rule::logical_and_expr => variadic_expression_helper(
+            pair,
+            info,
+            local_stack,
+            globals,
+            strings,
+            ComparisonOperation::And,
+        ),
+        Rule::equality_expr => {
+            eq_or_rel_expression_helper(pair, info, local_stack, globals, strings)
         }
-        Rule::logical_and_expr => {
-            variadic_expression_helper(pair, info, local_stack, globals, strings, ComparisonOperation::And)
+        Rule::relational_expr => {
+            eq_or_rel_expression_helper(pair, info, local_stack, globals, strings)
         }
-        Rule::equality_expr => eq_or_rel_expression_helper(pair, info, local_stack, globals, strings),
-        Rule::relational_expr => eq_or_rel_expression_helper(pair, info, local_stack, globals, strings),
-        Rule::additive_expr => mathematic_variadic_expression_helper(pair, info, local_stack, globals, strings),
-        Rule::multiplicative_expr => mathematic_variadic_expression_helper(pair, info, local_stack, globals, strings),
+        Rule::additive_expr => {
+            mathematic_variadic_expression_helper(pair, info, local_stack, globals, strings)
+        }
+        Rule::multiplicative_expr => {
+            mathematic_variadic_expression_helper(pair, info, local_stack, globals, strings)
+        }
         _ => unreachable!(),
     }
 }
@@ -967,7 +1058,13 @@ fn handle_primary_expression(
             }
         }
         Rule::call => {
-            info.pre_execution_code.append(&mut handle_function_call(pair, info.memory, local_stack, globals, strings));
+            info.pre_execution_code.append(&mut handle_function_call(
+                pair,
+                info.memory,
+                local_stack,
+                globals,
+                strings,
+            ));
 
             let dest = info.memory.next_free_memory();
 
@@ -980,9 +1077,13 @@ fn handle_primary_expression(
             dest
         }
         Rule::array_access => todo!(),
-        Rule::expression => {
-            build_expression_stack(pair.into_inner().next().unwrap(), info, local_stack, globals, strings)
-        }
+        Rule::expression => build_expression_stack(
+            pair.into_inner().next().unwrap(),
+            info,
+            local_stack,
+            globals,
+            strings,
+        ),
         Rule::ident => {
             let local_var = local_stack
                 .iter()
@@ -991,27 +1092,41 @@ fn handle_primary_expression(
             if let Some((_, local_mem)) = local_var {
                 // Inefficient as fuck, but fixes issues where multiplying the same local together caused register collisions
                 let mem = info.memory.next_free_memory();
-                info.stack.push(ExpressionInstruction { op: Operation::Mov, arg1: Operand::Memory(local_mem.to_owned()), arg2: Operand::Memory(mem.to_owned()) });
+                info.stack.push(ExpressionInstruction {
+                    op: Operation::Mov,
+                    arg1: Operand::Memory(local_mem.to_owned()),
+                    arg2: Operand::Memory(mem.to_owned()),
+                });
 
                 return mem;
             }
 
-            let global_var = globals
-                .iter()
-                .find(|g| g.as_str() == pair.as_str().trim());
+            let global_var = globals.iter().find(|g| g.as_str() == pair.as_str().trim());
 
             if let Some(global) = global_var {
                 // Deref the global into R15, then write it to some other place in memory to make sure another global load can't overwrite it
                 let mem = info.memory.next_free_memory();
-                info.stack.push(ExpressionInstruction { op: Operation::Mov, arg1: Operand::Global(global.to_owned()), arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)) });
-                info.stack.push(ExpressionInstruction { op: Operation::Mov, arg1: Operand::DereferencedMemory(Box::new(CalleeSavedRegister::R15), 0), arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)) });
-                info.stack.push(ExpressionInstruction { op: Operation::Mov, arg1: Operand::Memory(Box::new(CalleeSavedRegister::R15)), arg2: Operand::Memory(mem.to_owned()) });
+                info.stack.push(ExpressionInstruction {
+                    op: Operation::Mov,
+                    arg1: Operand::Global(global.to_owned()),
+                    arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)),
+                });
+                info.stack.push(ExpressionInstruction {
+                    op: Operation::Mov,
+                    arg1: Operand::DereferencedMemory(Box::new(CalleeSavedRegister::R15), 0),
+                    arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)),
+                });
+                info.stack.push(ExpressionInstruction {
+                    op: Operation::Mov,
+                    arg1: Operand::Memory(Box::new(CalleeSavedRegister::R15)),
+                    arg2: Operand::Memory(mem.to_owned()),
+                });
 
                 return mem;
             }
 
             panic!("Undefined variable `{}`!", pair.as_str().trim());
-        },
+        }
         _ => unreachable!(),
     }
 }
@@ -1112,7 +1227,11 @@ fn mathematic_variadic_expression_helper(
                 ));
             }
             _ => sub_expressions.push_back(StackEvaluationStep::Memory(build_expression_stack(
-                item, info, local_stack, globals, strings,
+                item,
+                info,
+                local_stack,
+                globals,
+                strings,
             ))),
         }
     }
@@ -1159,7 +1278,8 @@ fn eq_or_rel_expression_helper(
 
     info.depth += 1;
 
-    let left_operand = build_expression_stack(pairs.next().unwrap(), info, local_stack, globals, strings);
+    let left_operand =
+        build_expression_stack(pairs.next().unwrap(), info, local_stack, globals, strings);
     let op = match pairs.next().unwrap().as_str() {
         "==" => ComparisonOperation::Eq,
         "!=" => ComparisonOperation::Neq,
@@ -1169,7 +1289,8 @@ fn eq_or_rel_expression_helper(
         "<=" => ComparisonOperation::Lte,
         _ => unreachable!(),
     };
-    let right_operand = build_expression_stack(pairs.next().unwrap(), info, local_stack, globals, strings);
+    let right_operand =
+        build_expression_stack(pairs.next().unwrap(), info, local_stack, globals, strings);
 
     let mem = info.memory.next_free_memory();
 
@@ -1206,7 +1327,13 @@ fn variadic_expression_helper(
 
     let mut ops = VecDeque::new();
     for ops_item in pairs {
-        ops.push_back(build_expression_stack(ops_item, info, local_stack, globals, strings));
+        ops.push_back(build_expression_stack(
+            ops_item,
+            info,
+            local_stack,
+            globals,
+            strings,
+        ));
     }
 
     // All of these calls should realistically jump to the same place
