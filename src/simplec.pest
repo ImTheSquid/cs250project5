@@ -25,7 +25,7 @@ char = {
 
 literal = { integer | string }
 
-ident_name = { ASCII_ALPHA ~ ASCII_ALPHANUMERIC* }
+ident_name = { ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 
 ident = { address_of* ~ ident_name }
 
@@ -64,7 +64,13 @@ do_while_expr = { "do" ~ "{" ~ statement_list ~ "}" ~ "while" ~ "(" ~ expression
 
 for_expr = { "for" ~ "(" ~ assignment ~ expression ~ ";" ~ assignment ~ ")" ~ "{" ~ statement_list ~ "}" }
 
-flow_control = { ("continue" | "break" | "return" ~ expression) ~ ";"}
+flow_control = { (continue | break | return) ~ ";"}
+
+continue = { "continue" }
+
+break = { "break" }
+
+return = { "return" ~ expression? }
 
 expression = { logical_or_expr }
 

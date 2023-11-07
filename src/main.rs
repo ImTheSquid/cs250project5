@@ -15,9 +15,9 @@ use rand::distributions::{Alphanumeric, DistString};
 
 #[derive(Debug, ClapParser)]
 struct Args {
-    /// The output file
-    #[arg(short, default_value = "a.s")]
-    output: String,
+    /// The output file, defaults to <FILE>.s
+    #[arg(short)]
+    output: Option<String>,
 
     /// The SimpleC file to compile
     file: String,
@@ -79,7 +79,7 @@ struct StackAllocation {
 
 impl ToString for StackAllocation {
     fn to_string(&self) -> String {
-        format!("-{}(%rbx)", self.offset)
+        format!("-{}(%rbp)", self.offset)
     }
 }
 
@@ -155,19 +155,23 @@ enum ProgramItem {
     Global(String),
     Function {
         name: String,
-        args: HashSet<String>,
         stack_allocs: usize,
+        arg_destinations: Vec<Box<dyn Memory>>,
         children: Vec<ProgramItem>,
     },
     FunctionCall {
         name: String,
-        args: Vec<ProgramItem>,
+        args: Vec<Box<dyn Memory>>,
     },
     Expression {
         stack: Vec<ExpressionInstruction>,
         output: Box<dyn Memory>,
         destination: ExpressionDestination,
     },
+    Return {
+        name: String,
+        value: Vec<ProgramItem>,
+    }
 }
 
 impl ProgramItem {
@@ -178,8 +182,8 @@ impl ProgramItem {
             }
             ProgramItem::Function {
                 name,
-                args,
                 stack_allocs,
+                arg_destinations,
                 children,
             } => {
                 // Header
@@ -207,7 +211,7 @@ impl ProgramItem {
                     stack_allocs
                 } else {
                     stack_allocs + 1
-                };
+                } - 6;
 
                 if stack_allocs > 0 {
                     writer.write_all("\txorq %r15, %r15\n".as_bytes())?;
@@ -216,10 +220,18 @@ impl ProgramItem {
                     }
                 }
 
+                // Args
+                for (arg_dest, reg) in arg_destinations.into_iter().zip(ARGUMENT_REGISTERS) {
+                    writer.write_all(format!("\tmovq {}, {}\n", reg.to_string(), arg_dest.to_string()).as_bytes())?;
+                }
+
                 // Content
                 for child in children {
                     child.write(writer)?;
                 }
+
+                // Add a label for a RETURN jump
+                writer.write_all(format!("__{name}_exit:\n").as_bytes())?;
 
                 if stack_allocs > 0 {
                     for _ in 0..stack_allocs {
@@ -244,15 +256,15 @@ impl ProgramItem {
                     "More args than supported for function `{name}`"
                 );
 
-                for src in args {
+                for (src, reg) in args.into_iter().zip(ARGUMENT_REGISTERS) {
                     // writer.write_all(format!("\tmovq %{} %{}\n", src.to_string(), dest.to_string()).as_bytes())?;
-                    src.write(writer)?;
+                    writer.write_all(format!("\tmovq {}, {}\n", src.to_string(), reg.to_string()).as_bytes())?;
                 }
 
                 // Safety for variadics if called
                 writer.write_all("\txorq %rax, %rax\n".as_bytes())?;
 
-                writer.write_all(format!("call {name}\n").as_bytes())?;
+                writer.write_all(format!("\tcall {name}\n").as_bytes())?;
 
                 Ok(())
             }
@@ -261,11 +273,6 @@ impl ProgramItem {
                 output,
                 destination,
             } => {
-                println!("expression writing is hard ================================");
-                println!("STACK: {:#?}", stack);
-                println!("OUTPUT: {}", output.to_string());
-                println!("DESTINATION: {:#?}", destination);
-
                 for instruction in stack {
                     instruction.write(writer)?;
                 }
@@ -277,10 +284,12 @@ impl ProgramItem {
                                 writer.write_all(
                                     format!("\tmovq {}, %r15\n", output.to_string()).as_bytes(),
                                 )?;
+                                // TODO: What if v.offset != None?
                                 writer.write_all(
-                                    format!("\tmovq %r15, {}", m.to_string()).as_bytes(),
+                                    format!("\tmovq %r15, {}\n", m.to_string()).as_bytes(),
                                 )?;
                             } else {
+                                // TODO: What if v.offset != None?
                                 writer.write_all(
                                     format!("\tmovq {}, {}\n", output.to_string(), m.to_string())
                                         .as_bytes(),
@@ -290,7 +299,7 @@ impl ProgramItem {
                         RealizedVariableLocation::Global(g) => {
                             let (output, flag): (Box<dyn Memory>, bool) = if !output.is_register() {
                                 writer.write_all(
-                                    format!("\tpushq %r14\n\tmovq {}, %r14", output.to_string())
+                                    format!("\tpushq %r14\n\tmovq {}, %r14\n", output.to_string())
                                         .as_bytes(),
                                 )?;
                                 (Box::new(CalleeSavedRegister::R14), true)
@@ -300,14 +309,15 @@ impl ProgramItem {
 
                             writer.write_all(
                                 format!(
-                                    "\tmovq ${g}, %r15\n\tmovq {}, (%r15)\n",
-                                    output.to_string()
+                                    "\tmovq ${g}, %r15\n\tmovq {}, -{}(%r15)\n",
+                                    output.to_string(),
+                                    v.offset.unwrap_or(0)
                                 )
                                 .as_bytes(),
                             )?;
 
                             if flag {
-                                writer.write_all("\tpopq %r14".as_bytes())?;
+                                writer.write_all("\tpopq %r14\n".as_bytes())?;
                             }
                         }
                     },
@@ -315,7 +325,21 @@ impl ProgramItem {
                 }
 
                 Ok(())
-            }
+            },
+            Self::Return { name, value } => {
+                if value.is_empty() {
+                    // Return 0
+                    writer.write_all("\txorq %rax, %rax\n".as_bytes())?;
+                } else {
+                    for value in value {
+                        value.write(writer)?;
+                    }
+                }
+
+                writer.write_all(format!("\tjmp __{}_exit\n", name).as_bytes())?;
+
+                Ok(())
+            },
         }
     }
 }
@@ -323,7 +347,7 @@ impl ProgramItem {
 fn main() {
     let args = Args::parse();
 
-    let file = fs::read_to_string(args.file);
+    let file = fs::read_to_string(&args.file);
 
     let file = match file {
         Ok(contents) => contents,
@@ -347,7 +371,14 @@ fn main() {
 
     let program = parsed.into_iter().next().unwrap();
 
-    let file = fs::File::create(args.output);
+    let c_file_with_assembly_suffix = {
+        let mut file = args.file.split('.').map(|s| s.to_owned()).collect::<Vec<_>>();
+        let _ = file.pop();
+        file.push("s".to_string());
+        file.join(".")
+    };
+
+    let file = fs::File::create(args.output.unwrap_or(c_file_with_assembly_suffix));
 
     let file = match file {
         Ok(f) => f,
@@ -412,10 +443,16 @@ fn handle_global_decl(pair: Pair<'_, Rule>, globals: &mut HashSet<String>) -> Ve
         .collect()
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct MemoryManager {
     register_allocs: usize,
     stack_allocs: usize,
+}
+
+impl Default for MemoryManager {
+    fn default() -> Self {
+        Self { register_allocs: 0, stack_allocs: 6 }
+    }
 }
 
 impl MemoryManager {
@@ -487,7 +524,7 @@ fn handle_function(
             })
             .collect()
     } else {
-        HashSet::new()
+        Vec::new()
     };
 
     let statements = if args_list_is_statements {
@@ -499,8 +536,15 @@ fn handle_function(
     let mut local_stack = HashMap::<String, Box<dyn Memory>>::new();
     let mut memory = MemoryManager::default();
 
+    let mut arg_mems = Vec::new();
+    for arg in arg_list_str {
+        let mem = memory.next_free_memory();
+        local_stack.insert(arg, mem.to_owned());
+        arg_mems.push(mem);
+    }
+
     // Function may not have a body
-    let children = if let Some(statements) = statements {
+    let children: Vec<ProgramItem> = if let Some(statements) = statements {
         statements
             .into_inner()
             .flat_map(|statement| match statement.as_rule() {
@@ -508,19 +552,26 @@ fn handle_function(
                     handle_local_decl(statement, &mut memory, &mut local_stack, globals);
                     vec![]
                 }
-                Rule::assignment => vec![handle_assignment(
+                Rule::assignment => handle_assignment(
                     statement,
                     &mut memory,
                     &local_stack,
                     globals,
                     strings,
-                )],
-                Rule::call => vec![handle_function_call(statement)],
+                ),
+                Rule::call => handle_function_call(statement, &mut memory, &local_stack, globals, strings),
                 Rule::if_expr => todo!(),
                 Rule::while_expr => todo!(),
                 Rule::do_while_expr => todo!(),
                 Rule::for_expr => todo!(),
-                Rule::flow_control => todo!(),
+                Rule::flow_control => {
+                    // continue and return are not allowed in the outermost scope, so this has to be a return
+                    let flow_control = statement.into_inner().next().unwrap().into_inner().next();
+
+                    vec![
+                        ProgramItem::Return { name: ident.to_string(), value: flow_control.map(|p| handle_expression(p, &mut memory, &local_stack, globals, ExpressionDestination::Variable(RealizedVariable { location: RealizedVariableLocation::Memory(Box::new(UtilRegister::Rax)), offset: None }), strings)).unwrap_or_default() }
+                    ]
+                },
                 _ => unreachable!(),
             })
             .collect()
@@ -530,14 +581,28 @@ fn handle_function(
 
     ProgramItem::Function {
         name: ident.to_string(),
-        args: arg_list_str,
         stack_allocs: memory.stack_allocs,
+        arg_destinations: arg_mems,
         children,
     }
 }
 
-fn handle_function_call(pair: Pair<'_, Rule>) -> ProgramItem {
-    todo!()
+fn handle_function_call(pair: Pair<'_, Rule>, memory: &mut MemoryManager, local_stack: &HashMap<String, Box<dyn Memory>>, globals: &HashSet<String>, strings: &mut Vec<String>) -> Vec<ProgramItem> {
+    let mut pairs = pair.into_inner();
+
+    let ident = pairs.next().unwrap();
+
+    if pairs.len() > ARGUMENT_REGISTERS.len() {
+        panic!("Too many arguments!");
+    }
+
+    let args = pairs.next().unwrap().into_inner();
+
+    let mems= (0..args.len()).map(|_| memory.next_free_memory()).collect::<Vec<_>>();
+
+    args.zip(mems.clone()).flat_map(|(arg, mem)| {
+        handle_expression(arg.into_inner().next().unwrap(), memory, local_stack, globals, ExpressionDestination::Variable(RealizedVariable { location: RealizedVariableLocation::Memory(mem.to_owned()), offset: None }), strings)
+    }).chain(vec![ProgramItem::FunctionCall { name: ident.as_str().to_owned(), args: mems }]).collect()
 }
 
 fn handle_local_decl(
@@ -581,7 +646,7 @@ fn handle_assignment(
     local_stack: &HashMap<String, Box<dyn Memory>>,
     globals: &HashSet<String>,
     strings: &mut Vec<String>,
-) -> ProgramItem {
+) -> Vec<ProgramItem> {
     let mut pairs = pair.into_inner();
 
     let dest = pairs.next().unwrap();
@@ -594,7 +659,7 @@ fn handle_assignment(
             location: local_stack
                 .iter()
                 .find(|(lsv, _)| lsv.as_str() == dest.as_str().trim())
-                .map(|(v, m)| RealizedVariableLocation::Memory(m.to_owned()))
+                .map(|(_, m)| RealizedVariableLocation::Memory(m.to_owned()))
                 .or_else(|| {
                     globals
                         .iter()
@@ -610,6 +675,8 @@ fn handle_assignment(
     handle_expression(
         pairs.next().unwrap(),
         memory,
+        local_stack,
+        globals,
         ExpressionDestination::Variable(rv),
         strings,
     )
@@ -622,6 +689,7 @@ struct ExpressionInfo<'a> {
     stack: Vec<ExpressionInstruction>,
     memory: &'a mut MemoryManager,
     jump_destination: Option<JumpDestination>,
+    pre_execution_code: Vec<ProgramItem>,
 }
 
 impl ExpressionInfo<'_> {
@@ -650,7 +718,7 @@ impl ExpressionInstruction {
 #[derive(Debug)]
 enum Operand {
     Memory(Box<dyn Memory>),
-    OffsetMemory(Box<dyn Memory>, usize),
+    DereferencedMemory(Box<dyn Memory>, usize),
     Global(String),
     StringConstant(usize),
     IntegerConstant(i64),
@@ -660,7 +728,7 @@ impl ToString for Operand {
     fn to_string(&self) -> String {
         match self {
             Operand::Memory(m) => m.to_string(),
-            Operand::OffsetMemory(m, o) => {
+            Operand::DereferencedMemory(m, o) => {
                 if m.is_register() {
                     format!("-{o}({})", m.to_string())
                 } else {
@@ -707,9 +775,16 @@ impl Operation {
             Operation::Add => writer.write_all(
                 format!("\taddq {}, {}\n", arg1.to_string(), arg2.to_string()).as_bytes(),
             ),
-            Operation::Sub => writer.write_all(
-                format!("\tsubq {}, {}\n", arg1.to_string(), arg2.to_string()).as_bytes(),
-            ),
+            Operation::Sub => {
+                writer.write_all(
+                    format!("\tsubq {}, {}\n", arg1.to_string(), arg2.to_string()).as_bytes(),
+                )?;
+
+                // I forgot how subtraction works but this seems to fix the problem
+                writer.write_all(format!("\tnegq {}\n", arg2.to_string()).as_bytes())?;
+
+                Ok(())
+            },
             Operation::Mult => {
                 writer
                     .write_all(format!("\tmovq {}, %rax\n\tcqo\n", arg1.to_string()).as_bytes())?;
@@ -751,7 +826,7 @@ fn write_temp_register_if_needed<W: Write>(
 ) -> Result<Operand, std::io::Error> {
     match arg1 {
         Operand::Memory(_) => match arg2 {
-            Operand::Memory(m2) | Operand::OffsetMemory(m2, _) => {
+            Operand::Memory(m2) | Operand::DereferencedMemory(m2, _) => {
                 if m2.is_register() {
                     return Ok(arg1);
                 }
@@ -762,8 +837,8 @@ fn write_temp_register_if_needed<W: Write>(
             }
             _ => Ok(arg1),
         },
-        Operand::OffsetMemory(_, _) => match arg2 {
-            Operand::Memory(m2) | Operand::OffsetMemory(m2, _) => {
+        Operand::DereferencedMemory(_, _) => match arg2 {
+            Operand::Memory(m2) | Operand::DereferencedMemory(m2, _) => {
                 if m2.is_register() {
                     return Ok(arg1);
                 }
@@ -799,10 +874,12 @@ struct JumpDestination {
 fn handle_expression(
     pair: Pair<'_, Rule>,
     memory: &mut MemoryManager,
+    local_stack: &HashMap<String, Box<dyn Memory>>,
+    globals: &HashSet<String>,
     // Where to try to jump if a JMP operation is necessary and succeeds
     destination: ExpressionDestination,
     strings: &mut Vec<String>,
-) -> ProgramItem {
+) -> Vec<ProgramItem> {
     let jump_destination = match &destination {
         ExpressionDestination::Variable(_) => None,
         ExpressionDestination::ConditionalJump(jd) => Some(jd.to_owned()),
@@ -814,33 +891,40 @@ fn handle_expression(
         depth: 0,
         pointer_vars: 0,
         stack: vec![],
+        pre_execution_code: vec![],
     };
-    let expr = build_expression_stack(pair.into_inner().next().unwrap(), &mut expr_info, strings);
+    let expr = build_expression_stack(pair.into_inner().next().unwrap(), &mut expr_info, local_stack, globals, strings);
 
-    ProgramItem::Expression {
-        stack: expr_info.stack,
-        output: expr,
-        destination,
-    }
+    println!("{:#?}", expr_info);
+
+    expr_info.pre_execution_code.into_iter().chain(vec![
+        ProgramItem::Expression {
+            stack: expr_info.stack,
+            output: expr,
+            destination,
+        }
+    ]).collect()
 }
 
 fn build_expression_stack(
     pair: Pair<'_, Rule>,
     info: &mut ExpressionInfo,
+    local_stack: &HashMap<String, Box<dyn Memory>>,
+    globals: &HashSet<String>,
     strings: &mut Vec<String>,
 ) -> Box<dyn Memory> {
     match pair.as_rule() {
-        Rule::primary_expr => handle_primary_expression(pair, info, strings),
+        Rule::primary_expr => handle_primary_expression(pair, info, local_stack, globals, strings),
         Rule::logical_or_expr => {
-            variadic_expression_helper(pair, info, strings, ComparisonOperation::Or)
+            variadic_expression_helper(pair, info, local_stack, globals, strings, ComparisonOperation::Or)
         }
         Rule::logical_and_expr => {
-            variadic_expression_helper(pair, info, strings, ComparisonOperation::And)
+            variadic_expression_helper(pair, info, local_stack, globals, strings, ComparisonOperation::And)
         }
-        Rule::equality_expr => eq_or_rel_expression_helper(pair, info, strings),
-        Rule::relational_expr => eq_or_rel_expression_helper(pair, info, strings),
-        Rule::additive_expr => mathematic_variadic_expression_helper(pair, info, strings),
-        Rule::multiplicative_expr => mathematic_variadic_expression_helper(pair, info, strings),
+        Rule::equality_expr => eq_or_rel_expression_helper(pair, info, local_stack, globals, strings),
+        Rule::relational_expr => eq_or_rel_expression_helper(pair, info, local_stack, globals, strings),
+        Rule::additive_expr => mathematic_variadic_expression_helper(pair, info, local_stack, globals, strings),
+        Rule::multiplicative_expr => mathematic_variadic_expression_helper(pair, info, local_stack, globals, strings),
         _ => unreachable!(),
     }
 }
@@ -848,6 +932,8 @@ fn build_expression_stack(
 fn handle_primary_expression(
     pair: Pair<'_, Rule>,
     info: &mut ExpressionInfo,
+    local_stack: &HashMap<String, Box<dyn Memory>>,
+    globals: &HashSet<String>,
     strings: &mut Vec<String>,
 ) -> Box<dyn Memory> {
     info.depth += 1;
@@ -881,7 +967,7 @@ fn handle_primary_expression(
             }
         }
         Rule::call => {
-            handle_function_call(pair);
+            info.pre_execution_code.append(&mut handle_function_call(pair, info.memory, local_stack, globals, strings));
 
             let dest = info.memory.next_free_memory();
 
@@ -895,9 +981,37 @@ fn handle_primary_expression(
         }
         Rule::array_access => todo!(),
         Rule::expression => {
-            build_expression_stack(pair.into_inner().next().unwrap(), info, strings)
+            build_expression_stack(pair.into_inner().next().unwrap(), info, local_stack, globals, strings)
         }
-        Rule::ident => todo!(),
+        Rule::ident => {
+            let local_var = local_stack
+                .iter()
+                .find(|(lsv, _)| lsv.as_str() == pair.as_str().trim());
+
+            if let Some((_, local_mem)) = local_var {
+                // Inefficient as fuck, but fixes issues where multiplying the same local together caused register collisions
+                let mem = info.memory.next_free_memory();
+                info.stack.push(ExpressionInstruction { op: Operation::Mov, arg1: Operand::Memory(local_mem.to_owned()), arg2: Operand::Memory(mem.to_owned()) });
+
+                return mem;
+            }
+
+            let global_var = globals
+                .iter()
+                .find(|g| g.as_str() == pair.as_str().trim());
+
+            if let Some(global) = global_var {
+                // Deref the global into R15, then write it to some other place in memory to make sure another global load can't overwrite it
+                let mem = info.memory.next_free_memory();
+                info.stack.push(ExpressionInstruction { op: Operation::Mov, arg1: Operand::Global(global.to_owned()), arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)) });
+                info.stack.push(ExpressionInstruction { op: Operation::Mov, arg1: Operand::DereferencedMemory(Box::new(CalleeSavedRegister::R15), 0), arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)) });
+                info.stack.push(ExpressionInstruction { op: Operation::Mov, arg1: Operand::Memory(Box::new(CalleeSavedRegister::R15)), arg2: Operand::Memory(mem.to_owned()) });
+
+                return mem;
+            }
+
+            panic!("Undefined variable `{}`!", pair.as_str().trim());
+        },
         _ => unreachable!(),
     }
 }
@@ -905,11 +1019,13 @@ fn handle_primary_expression(
 fn mathematic_variadic_expression_helper(
     pair: Pair<'_, Rule>,
     info: &mut ExpressionInfo,
+    local_stack: &HashMap<String, Box<dyn Memory>>,
+    globals: &HashSet<String>,
     strings: &mut Vec<String>,
 ) -> Box<dyn Memory> {
     let mut pairs = pair.into_inner();
     if pairs.len() == 1 {
-        return build_expression_stack(pairs.next().unwrap(), info, strings);
+        return build_expression_stack(pairs.next().unwrap(), info, local_stack, globals, strings);
     }
 
     info.depth += 1;
@@ -996,7 +1112,7 @@ fn mathematic_variadic_expression_helper(
                 ));
             }
             _ => sub_expressions.push_back(StackEvaluationStep::Memory(build_expression_stack(
-                item, info, strings,
+                item, info, local_stack, globals, strings,
             ))),
         }
     }
@@ -1032,16 +1148,18 @@ fn mathematic_variadic_expression_helper(
 fn eq_or_rel_expression_helper(
     pair: Pair<'_, Rule>,
     info: &mut ExpressionInfo,
+    local_stack: &HashMap<String, Box<dyn Memory>>,
+    globals: &HashSet<String>,
     strings: &mut Vec<String>,
 ) -> Box<dyn Memory> {
     let mut pairs = pair.into_inner();
     if pairs.len() == 1 {
-        return build_expression_stack(pairs.next().unwrap(), info, strings);
+        return build_expression_stack(pairs.next().unwrap(), info, local_stack, globals, strings);
     }
 
     info.depth += 1;
 
-    let left_operand = build_expression_stack(pairs.next().unwrap(), info, strings);
+    let left_operand = build_expression_stack(pairs.next().unwrap(), info, local_stack, globals, strings);
     let op = match pairs.next().unwrap().as_str() {
         "==" => ComparisonOperation::Eq,
         "!=" => ComparisonOperation::Neq,
@@ -1051,7 +1169,7 @@ fn eq_or_rel_expression_helper(
         "<=" => ComparisonOperation::Lte,
         _ => unreachable!(),
     };
-    let right_operand = build_expression_stack(pairs.next().unwrap(), info, strings);
+    let right_operand = build_expression_stack(pairs.next().unwrap(), info, local_stack, globals, strings);
 
     let mem = info.memory.next_free_memory();
 
@@ -1074,19 +1192,21 @@ fn eq_or_rel_expression_helper(
 fn variadic_expression_helper(
     pair: Pair<'_, Rule>,
     info: &mut ExpressionInfo,
+    local_stack: &HashMap<String, Box<dyn Memory>>,
+    globals: &HashSet<String>,
     strings: &mut Vec<String>,
     op: ComparisonOperation,
 ) -> Box<dyn Memory> {
     let mut pairs = pair.into_inner();
     if pairs.len() == 1 {
-        return build_expression_stack(pairs.next().unwrap(), info, strings);
+        return build_expression_stack(pairs.next().unwrap(), info, local_stack, globals, strings);
     }
 
     info.depth += 1;
 
     let mut ops = VecDeque::new();
     for ops_item in pairs {
-        ops.push_back(build_expression_stack(ops_item, info, strings));
+        ops.push_back(build_expression_stack(ops_item, info, local_stack, globals, strings));
     }
 
     // All of these calls should realistically jump to the same place
