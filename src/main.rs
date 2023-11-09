@@ -1477,12 +1477,12 @@ fn variadic_expression_helper(
                 op,
                 dest: dest.clone(),
             },
-            arg1: if op == ComparisonOperation::And {
+            arg1: Operand::Memory(op_mem),
+            arg2: if op == ComparisonOperation::And {
                 Operand::IntegerConstant(1)
             } else {
                 Operand::IntegerConstant(0)
             },
-            arg2: Operand::Memory(op_mem),
         });
 
         // comparison_register = next_result;
