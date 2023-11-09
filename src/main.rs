@@ -804,7 +804,7 @@ enum Operation {
         op: ComparisonOperation,
         store: Box<dyn Memory>,
         dest: JumpDestination,
-    }
+    },
 }
 
 impl Operation {
@@ -874,9 +874,9 @@ impl Operation {
 
                 let jump_type = match op {
                     ComparisonOperation::Eq => "jz",
-                    ComparisonOperation::Neq |
-                    ComparisonOperation::Or |
-                    ComparisonOperation::And => "jnz",
+                    ComparisonOperation::Neq
+                    | ComparisonOperation::Or
+                    | ComparisonOperation::And => "jnz",
                     ComparisonOperation::Gt => "jg",
                     ComparisonOperation::Lt => "jl",
                     ComparisonOperation::Gte => "jge",
@@ -888,34 +888,56 @@ impl Operation {
                 }
 
                 Ok(())
-            },
+            }
             Operation::CmpJmpDestination { op, store, dest } => {
-                writer.write_all(format!("\tmovq ${}, {}\n", if matches!(op, ComparisonOperation::Or) {0} else {1}, store.to_string()).as_bytes())?;
+                writer.write_all(
+                    format!(
+                        "\tmovq ${}, {}\n",
+                        if matches!(op, ComparisonOperation::Or) {
+                            0
+                        } else {
+                            1
+                        },
+                        store.to_string()
+                    )
+                    .as_bytes(),
+                )?;
                 writer.write_all(format!("\tjmp {}\n", dest.end).as_bytes())?;
 
                 if let Some(then) = dest.then {
                     writer.write_all(format!("{}:\n", then).as_bytes())?;
-                    writer.write_all(format!("\tmovq ${}, {}\n", if matches!(op, ComparisonOperation::Or) {1} else {0}, store.to_string()).as_bytes())?;
+                    writer.write_all(
+                        format!(
+                            "\tmovq ${}, {}\n",
+                            if matches!(op, ComparisonOperation::Or) {
+                                1
+                            } else {
+                                0
+                            },
+                            store.to_string()
+                        )
+                        .as_bytes(),
+                    )?;
                 }
 
                 writer.write_all(format!("{}:\n", dest.end).as_bytes())?;
-                
+
                 Ok(())
-            },
+            }
         }
     }
 }
 
 fn normalize_memory<W: Write>(writer: &mut W, mem: &mut Operand) -> Result<(), std::io::Error> {
     match *mem {
-        Operand::Memory(_) => {},
-        Operand::DereferencedMemory(_, _) => {},
-        Operand::Global(_) => {},
+        Operand::Memory(_) => {}
+        Operand::DereferencedMemory(_, _) => {}
+        Operand::Global(_) => {}
         Operand::StringConstant(_) => panic!("Invalid comparison!"),
         Operand::IntegerConstant(c) => {
             *mem = Operand::IntegerConstant(if c == 0 { 0 } else { 1 });
             return Ok(());
-        },
+        }
         Operand::NoWrite => unreachable!(),
     }
 
