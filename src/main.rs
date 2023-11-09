@@ -794,9 +794,13 @@ enum Operation {
     Div,
     Mod,
     Mov,
+    /// Optimized version of CmpJmp for when the value is immediately being put into a variable instead of being used as a condition
+    EqRel {
+        op: EqRelOperation,
+        store: Box<dyn Memory>,
+    },
     CmpJmp {
         op: ComparisonOperation,
-        store: Box<dyn Memory>,
         dest: JumpDestination,
     },
     /// The destination for the previous CmpJmp operation
@@ -862,14 +866,32 @@ impl Operation {
             Operation::Mov => writer.write_all(
                 format!("\tmovq {}, {}\n", arg1.to_string(), arg2.to_string()).as_bytes(),
             ),
-            Operation::CmpJmp { op, store, dest } => {
+            Operation::EqRel { op, store } => {
+                writer.write_all(format!("\tcmpq {}, {}\n", arg2.to_string(), arg1.to_string()).as_bytes())?;
+
+                let set_type = match op {
+                    EqRelOperation::Eq => "setz",
+                    EqRelOperation::Neq => "setnz",
+                    EqRelOperation::Gt => "setg",
+                    EqRelOperation::Lt => "setl",
+                    EqRelOperation::Gte => "setge",
+                    EqRelOperation::Lte => "setle",
+                };
+
+                writer.write_all(format!("\t{set_type} {}\n", store.to_string()).as_bytes())?;
+                // This is only a precaution. Theoretically this shouldn't have any higher bytes, but I can't be sure in the future
+                writer.write_all(format!("\tandq $1, {}\n", store.to_string()).as_bytes())?;
+
+                Ok(())
+            },
+            Operation::CmpJmp { op, dest } => {
                 if matches!(op, ComparisonOperation::And | ComparisonOperation::Or) {
                     // Normalize the values (the second value is always 0 or 1, so always normalized)
                     normalize_memory(writer, &mut arg2)?;
                 }
 
                 writer.write_all(
-                    format!("\tcmpq {}, {}\n", arg1.to_string(), arg2.to_string()).as_bytes(),
+                    format!("\tcmpq {}, {}\n", arg2.to_string(), arg1.to_string()).as_bytes(),
                 )?;
 
                 let jump_type = match op {
@@ -988,6 +1010,16 @@ fn write_temp_register_if_needed<W: Write>(
 enum ComparisonOperation {
     And,
     Or,
+    Eq,
+    Neq,
+    Gt,
+    Lt,
+    Gte,
+    Lte,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EqRelOperation {
     Eq,
     Neq,
     Gt,
@@ -1343,13 +1375,13 @@ fn eq_or_rel_expression_helper(
 
     let left_operand =
         build_expression_stack(pairs.next().unwrap(), info, local_stack, globals, strings);
-    let op = match pairs.next().unwrap().as_str() {
-        "==" => ComparisonOperation::Eq,
-        "!=" => ComparisonOperation::Neq,
-        ">" => ComparisonOperation::Gt,
-        "<" => ComparisonOperation::Lt,
-        ">=" => ComparisonOperation::Gte,
-        "<=" => ComparisonOperation::Lte,
+    let (eop, cop) = match pairs.next().unwrap().as_str() {
+        "==" => (EqRelOperation::Eq, ComparisonOperation::Eq),
+        "!=" => (EqRelOperation::Neq, ComparisonOperation::Neq),
+        ">" => (EqRelOperation::Gt, ComparisonOperation::Gt),
+        "<" => (EqRelOperation::Lt, ComparisonOperation::Lt),
+        ">=" => (EqRelOperation::Gte, ComparisonOperation::Gte),
+        "<=" => (EqRelOperation::Lte, ComparisonOperation::Lte),
         _ => unreachable!(),
     };
     let right_operand =
@@ -1357,18 +1389,40 @@ fn eq_or_rel_expression_helper(
 
     let mem = info.memory.next_free_memory();
 
+    let has_jump = info.jump_destination.is_some();
+
     info.stack.push(ExpressionInstruction {
-        op: Operation::CmpJmp {
-            op,
-            store: dyn_clone::clone_box(mem.as_ref()),
-            dest: info
-                .jump_destination
-                .take()
-                .unwrap_or_else(|| info.generate_jump_destination()),
+        op: if has_jump {
+            Operation::CmpJmp {
+                op: cop,
+                dest: info
+                    .jump_destination
+                    .clone()
+                    .take()
+                    .unwrap(),
+            }
+        } else {
+            Operation::EqRel { op: eop, store: dyn_clone::clone_box(mem.as_ref()) }
         },
         arg1: Operand::Memory(left_operand),
         arg2: Operand::Memory(right_operand),
     });
+
+    if has_jump {
+        info.stack.push(ExpressionInstruction {
+            op: Operation::CmpJmpDestination {
+                op: cop,
+                store: dyn_clone::clone_box(mem.as_ref()),
+                dest: info
+                    .jump_destination
+                    .clone()
+                    .take()
+                    .unwrap(),
+            },
+            arg1: Operand::NoWrite,
+            arg2: Operand::NoWrite,
+        });
+    }
 
     mem
 }
@@ -1421,7 +1475,6 @@ fn variadic_expression_helper(
         info.stack.push(ExpressionInstruction {
             op: Operation::CmpJmp {
                 op,
-                store: dyn_clone::clone_box(final_result.as_ref()),
                 dest: dest.clone(),
             },
             arg1: if op == ComparisonOperation::And {
