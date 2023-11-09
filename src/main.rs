@@ -481,6 +481,13 @@ impl MemoryManager {
             })
         }
     }
+
+    fn next_free_stack_memory(&mut self) -> Box<dyn Memory> {
+        self.stack_allocs += 1;
+        Box::new(StackAllocation {
+            offset: 8 * (self.stack_allocs - 1),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -542,7 +549,8 @@ fn handle_function(
 
     let mut arg_mems = Vec::new();
     for arg in arg_list_str {
-        let mem = memory.next_free_memory();
+        // Allocate stack memory since &ident may happen
+        let mem = memory.next_free_stack_memory();
         local_stack.insert(arg, mem.to_owned());
         arg_mems.push(mem);
     }
@@ -673,7 +681,8 @@ fn handle_local_decl(
             );
         }
 
-        local_stack.insert(ident.as_str().to_string(), memory.next_free_memory());
+        // Allocate stack memory since &ident may happen
+        local_stack.insert(ident.as_str().to_string(), memory.next_free_stack_memory());
     }
 }
 
