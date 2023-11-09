@@ -739,7 +739,6 @@ impl ExpressionInfo<'_> {
         let identifier = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
         JumpDestination {
             then: Some(format!("__{}_then", &identifier)),
-            otherwise: Some(format!("__{}_else", &identifier)),
             end: format!("__{}_end", &identifier),
         }
     }
@@ -765,6 +764,7 @@ enum Operand {
     Global(String),
     StringConstant(usize),
     IntegerConstant(i64),
+    NoWrite,
 }
 
 impl ToString for Operand {
@@ -781,6 +781,7 @@ impl ToString for Operand {
             Operand::Global(name) => format!("${name}"),
             Operand::StringConstant(i) => format!("$global_string_{i}"),
             Operand::IntegerConstant(i) => format!("${i}"),
+            Operand::NoWrite => unimplemented!(),
         }
     }
 }
@@ -798,6 +799,12 @@ enum Operation {
         store: Box<dyn Memory>,
         dest: JumpDestination,
     },
+    /// The destination for the previous CmpJmp operation
+    CmpJmpDestination {
+        op: ComparisonOperation,
+        store: Box<dyn Memory>,
+        dest: JumpDestination,
+    }
 }
 
 impl Operation {
@@ -805,10 +812,10 @@ impl Operation {
         self,
         writer: &mut W,
         arg1: Operand,
-        arg2: Operand,
+        mut arg2: Operand,
     ) -> Result<(), std::io::Error> {
         // The multiplication operations already use RAX for the operation, therefore they have a temp register built-in and don't need another temp
-        let arg1 = if matches!(self, Operation::Div | Operation::Mod | Operation::Mult) {
+        let mut arg1 = if matches!(self, Operation::Div | Operation::Mod | Operation::Mult) {
             arg1
         } else {
             write_temp_register_if_needed(writer, arg1, &arg2)?
@@ -856,15 +863,20 @@ impl Operation {
                 format!("\tmovq {}, {}\n", arg1.to_string(), arg2.to_string()).as_bytes(),
             ),
             Operation::CmpJmp { op, store, dest } => {
+                if matches!(op, ComparisonOperation::And | ComparisonOperation::Or) {
+                    // Normalize the values (the second value is always 0 or 1, so always normalized)
+                    normalize_memory(writer, &mut arg2)?;
+                }
+
                 writer.write_all(
                     format!("\tcmpq {}, {}\n", arg1.to_string(), arg2.to_string()).as_bytes(),
                 )?;
 
                 let jump_type = match op {
-                    ComparisonOperation::And => todo!(),
-                    ComparisonOperation::Or => todo!(),
                     ComparisonOperation::Eq => "jz",
-                    ComparisonOperation::Neq => "jnz",
+                    ComparisonOperation::Neq |
+                    ComparisonOperation::Or |
+                    ComparisonOperation::And => "jnz",
                     ComparisonOperation::Gt => "jg",
                     ComparisonOperation::Lt => "jl",
                     ComparisonOperation::Gte => "jge",
@@ -875,15 +887,43 @@ impl Operation {
                     writer.write_all(format!("\t{jump_type} {then}\n").as_bytes())?;
                 }
 
-                if let Some(otherwise) = &dest.then {
-                    writer.write_all(format!("\tjmp {otherwise}\n").as_bytes())?;
-                } else {
+                Ok(())
+            },
+            Operation::CmpJmpDestination { op, store, dest } => {
+                writer.write_all(format!("\tmovq ${}, {}\n", if matches!(op, ComparisonOperation::Or) {0} else {1}, store.to_string()).as_bytes())?;
+                writer.write_all(format!("\tjmp {}\n", dest.end).as_bytes())?;
+
+                if let Some(then) = dest.then {
+                    writer.write_all(format!("{}:\n", then).as_bytes())?;
+                    writer.write_all(format!("\tmovq ${}, {}\n", if matches!(op, ComparisonOperation::Or) {1} else {0}, store.to_string()).as_bytes())?;
                 }
 
-                todo!()
-            }
+                writer.write_all(format!("{}:\n", dest.end).as_bytes())?;
+                
+                Ok(())
+            },
         }
     }
+}
+
+fn normalize_memory<W: Write>(writer: &mut W, mem: &mut Operand) -> Result<(), std::io::Error> {
+    match *mem {
+        Operand::Memory(_) => {},
+        Operand::DereferencedMemory(_, _) => {},
+        Operand::Global(_) => {},
+        Operand::StringConstant(_) => panic!("Invalid comparison!"),
+        Operand::IntegerConstant(c) => {
+            *mem = Operand::IntegerConstant(if c == 0 { 0 } else { 1 });
+            return Ok(());
+        },
+        Operand::NoWrite => unreachable!(),
+    }
+
+    writer.write_all(format!("\tcmpq $0, {}\n", mem.to_string()).as_bytes())?;
+    writer.write_all(format!("\tsetnz {}\n", mem.to_string()).as_bytes())?;
+    writer.write_all(format!("\tandq $1, {}\n", mem.to_string()).as_bytes())?;
+
+    Ok(())
 }
 
 /// In case an instruction ends up needing multiple references (like `imulq -8(%rbx), -16(%rbx)`),
@@ -937,7 +977,6 @@ enum ComparisonOperation {
 #[derive(Debug, Clone)]
 struct JumpDestination {
     then: Option<String>,
-    otherwise: Option<String>,
     end: String,
 }
 
@@ -1363,16 +1402,26 @@ fn variadic_expression_helper(
                 store: dyn_clone::clone_box(final_result.as_ref()),
                 dest: dest.clone(),
             },
-            arg1: Operand::Memory(op_mem),
-            arg2: if op == ComparisonOperation::And {
+            arg1: if op == ComparisonOperation::And {
                 Operand::IntegerConstant(1)
             } else {
                 Operand::IntegerConstant(0)
             },
+            arg2: Operand::Memory(op_mem),
         });
 
         // comparison_register = next_result;
     }
+
+    info.stack.push(ExpressionInstruction {
+        op: Operation::CmpJmpDestination {
+            op,
+            store: dyn_clone::clone_box(final_result.as_ref()),
+            dest: dest.clone(),
+        },
+        arg1: Operand::NoWrite,
+        arg2: Operand::NoWrite,
+    });
 
     // comparison_register
     final_result
