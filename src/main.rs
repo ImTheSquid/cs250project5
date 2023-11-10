@@ -1,3 +1,5 @@
+#![warn(clippy::todo)]
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Debug,
@@ -32,6 +34,12 @@ struct SimpleCParser;
 trait Memory: ToString + Debug + DynClone {
     // Decides whether a dereference is necessary
     fn is_register(&self) -> bool;
+
+    /// For address of operator
+    /// Panics if a register
+    fn stack_offset(&self) -> usize {
+        panic!("This is not a stack! Stack offset not implemented.")
+    }
 }
 
 dyn_clone::clone_trait_object!(Memory);
@@ -87,6 +95,10 @@ impl Memory for StackAllocation {
     fn is_register(&self) -> bool {
         false
     }
+
+    fn stack_offset(&self) -> usize {
+        self.offset
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -131,6 +143,7 @@ impl ToString for ArgumentRegister {
 #[derive(Debug, Clone, Copy)]
 enum UtilRegister {
     Rax,
+    Rsp,
 }
 
 impl Memory for UtilRegister {
@@ -143,6 +156,7 @@ impl ToString for UtilRegister {
     fn to_string(&self) -> String {
         match self {
             Self::Rax => "%rax",
+            Self::Rsp => "%rsp",
         }
         .to_string()
     }
@@ -285,8 +299,8 @@ impl ProgramItem {
                 }
 
                 match destination {
-                    ExpressionDestination::Variable(v) => match v.location {
-                        RealizedVariableLocation::Memory(m) => {
+                    ExpressionDestination::Variable(v) => match v {
+                        RealizedVariable::Memory(m) => {
                             if !output.is_register() && !m.is_register() {
                                 writer.write_all(
                                     format!("\tmovq {}, %r15\n", output.to_string()).as_bytes(),
@@ -303,7 +317,7 @@ impl ProgramItem {
                                 )?;
                             }
                         }
-                        RealizedVariableLocation::Global(g) => {
+                        RealizedVariable::Global(g) => {
                             let (output, flag): (Box<dyn Memory>, bool) = if !output.is_register() {
                                 writer.write_all(
                                     format!("\tpushq %r14\n\tmovq {}, %r14\n", output.to_string())
@@ -316,9 +330,8 @@ impl ProgramItem {
 
                             writer.write_all(
                                 format!(
-                                    "\tmovq ${g}, %r15\n\tmovq {}, -{}(%r15)\n",
-                                    output.to_string(),
-                                    v.offset.unwrap_or(0)
+                                    "\tmovq ${g}, %r15\n\tmovq {}, (%r15)\n",
+                                    output.to_string()
                                 )
                                 .as_bytes(),
                             )?;
@@ -326,7 +339,8 @@ impl ProgramItem {
                             if flag {
                                 writer.write_all("\tpopq %r14\n".as_bytes())?;
                             }
-                        }
+                        },
+                        RealizedVariable::Offset(inner, offset) => todo!(),
                     },
                     ExpressionDestination::ConditionalJump(_) => todo!(),
                 }
@@ -475,10 +489,7 @@ impl MemoryManager {
             self.register_allocs += 1;
             Box::new(REGISTER_STACK[self.register_allocs - 1])
         } else {
-            self.stack_allocs += 1;
-            Box::new(StackAllocation {
-                offset: 8 * (self.stack_allocs - 1),
-            })
+            self.next_free_stack_memory()
         }
     }
 
@@ -491,16 +502,10 @@ impl MemoryManager {
 }
 
 #[derive(Debug, Clone)]
-enum RealizedVariableLocation {
+enum RealizedVariable {
     Memory(Box<dyn Memory>),
+    Offset(Box<RealizedVariable>, usize),
     Global(String),
-}
-
-/// The regular variable doesn't take into account where things are placed in generated assembly, so this does
-#[derive(Debug, Clone)]
-struct RealizedVariable {
-    location: RealizedVariableLocation,
-    offset: Option<usize>,
 }
 
 fn handle_function(
@@ -587,12 +592,9 @@ fn handle_function(
                                     &mut memory,
                                     &local_stack,
                                     globals,
-                                    ExpressionDestination::Variable(RealizedVariable {
-                                        location: RealizedVariableLocation::Memory(Box::new(
-                                            UtilRegister::Rax,
-                                        )),
-                                        offset: None,
-                                    }),
+                                    ExpressionDestination::Variable(RealizedVariable::Memory(Box::new(
+                                        UtilRegister::Rax,
+                                    ))),
                                     strings,
                                 )
                             })
@@ -642,10 +644,7 @@ fn handle_function_call(
                 memory,
                 local_stack,
                 globals,
-                ExpressionDestination::Variable(RealizedVariable {
-                    location: RealizedVariableLocation::Memory(mem.to_owned()),
-                    offset: None,
-                }),
+                ExpressionDestination::Variable(RealizedVariable::Memory(mem.to_owned())),
                 strings,
             )
         })
@@ -705,22 +704,24 @@ fn handle_assignment(
 
     let rv = match dest.as_rule() {
         Rule::array_access => {
+            let mut pairs = dest.into_inner();
+            let ident = pairs.next().unwrap();
+            let offset_expressions = pairs.collect::<Vec<_>>();
+
+            
             todo!()
         }
-        Rule::ident_name => RealizedVariable {
-            location: local_stack
-                .iter()
-                .find(|(lsv, _)| lsv.as_str() == dest.as_str().trim())
-                .map(|(_, m)| RealizedVariableLocation::Memory(m.to_owned()))
-                .or_else(|| {
-                    globals
-                        .iter()
-                        .find(|g| g.as_str() == dest.as_str().trim())
-                        .map(|g| RealizedVariableLocation::Global(g.to_owned()))
-                })
-                .expect("Undeclared variable!"),
-            offset: None,
-        },
+        Rule::ident_name => local_stack
+            .iter()
+            .find(|(lsv, _)| lsv.as_str() == dest.as_str().trim())
+            .map(|(_, m)| RealizedVariable::Memory(m.to_owned()))
+            .or_else(|| {
+                globals
+                    .iter()
+                    .find(|g| g.as_str() == dest.as_str().trim())
+                    .map(|g| RealizedVariable::Global(g.to_owned()))
+            })
+            .expect("Undeclared variable!"),
         _ => unreachable!(),
     };
 
@@ -790,7 +791,7 @@ impl ToString for Operand {
             Operand::Global(name) => format!("${name}"),
             Operand::StringConstant(i) => format!("$global_string_{i}"),
             Operand::IntegerConstant(i) => format!("${i}"),
-            Operand::NoWrite => unimplemented!(),
+            Operand::NoWrite => unreachable!(),
         }
     }
 }
@@ -828,7 +829,7 @@ impl Operation {
         mut arg2: Operand,
     ) -> Result<(), std::io::Error> {
         // The multiplication operations already use RAX for the operation, therefore they have a temp register built-in and don't need another temp
-        let mut arg1 = if matches!(self, Operation::Div | Operation::Mod | Operation::Mult) {
+        let arg1 = if matches!(self, Operation::Div | Operation::Mod | Operation::Mult) {
             arg1
         } else {
             write_temp_register_if_needed(writer, arg1, &arg2)?
@@ -1064,6 +1065,7 @@ fn handle_expression(
         stack: vec![],
         pre_execution_code: vec![],
     };
+
     let expr = build_expression_stack(
         pair.into_inner().next().unwrap(),
         &mut expr_info,
@@ -1189,6 +1191,14 @@ fn handle_primary_expression(
             strings,
         ),
         Rule::ident => {
+            let mut pairs = pair.into_inner();
+            let address_of = pairs.len() == 2;
+            if address_of {
+                let _ = pairs.next();
+            }
+
+            let pair = pairs.next().unwrap();
+
             let local_var = local_stack
                 .iter()
                 .find(|(lsv, _)| lsv.as_str() == pair.as_str().trim());
@@ -1196,11 +1206,25 @@ fn handle_primary_expression(
             if let Some((_, local_mem)) = local_var {
                 // Inefficient as fuck, but fixes issues where multiplying the same local together caused register collisions
                 let mem = info.memory.next_free_memory();
-                info.stack.push(ExpressionInstruction {
-                    op: Operation::Mov,
-                    arg1: Operand::Memory(local_mem.to_owned()),
-                    arg2: Operand::Memory(mem.to_owned()),
-                });
+                if address_of {
+                    info.stack.push(ExpressionInstruction { 
+                        op: Operation::Mov, 
+                        arg1: Operand::Memory(Box::new(UtilRegister::Rsp)), 
+                        arg2: Operand::Memory(mem.to_owned()) 
+                    });
+
+                    info.stack.push(ExpressionInstruction { 
+                        op: Operation::Add, 
+                        arg1: Operand::IntegerConstant(local_mem.stack_offset() as i64), 
+                        arg2: Operand::Memory(mem.to_owned()) 
+                    });
+                } else {
+                    info.stack.push(ExpressionInstruction {
+                        op: Operation::Mov,
+                        arg1: Operand::Memory(local_mem.to_owned()),
+                        arg2: Operand::Memory(mem.to_owned()),
+                    });
+                }
 
                 return mem;
             }
@@ -1210,21 +1234,29 @@ fn handle_primary_expression(
             if let Some(global) = global_var {
                 // Deref the global into R15, then write it to some other place in memory to make sure another global load can't overwrite it
                 let mem = info.memory.next_free_memory();
-                info.stack.push(ExpressionInstruction {
-                    op: Operation::Mov,
-                    arg1: Operand::Global(global.to_owned()),
-                    arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)),
-                });
-                info.stack.push(ExpressionInstruction {
-                    op: Operation::Mov,
-                    arg1: Operand::DereferencedMemory(Box::new(CalleeSavedRegister::R15), 0),
-                    arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)),
-                });
-                info.stack.push(ExpressionInstruction {
-                    op: Operation::Mov,
-                    arg1: Operand::Memory(Box::new(CalleeSavedRegister::R15)),
-                    arg2: Operand::Memory(mem.to_owned()),
-                });
+                if address_of {
+                    info.stack.push(ExpressionInstruction { 
+                        op: Operation::Mov, 
+                        arg1: Operand::Global(global.to_owned()), 
+                        arg2: Operand::Memory(mem.to_owned()) 
+                    });
+                } else {
+                    info.stack.push(ExpressionInstruction {
+                        op: Operation::Mov,
+                        arg1: Operand::Global(global.to_owned()),
+                        arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)),
+                    });
+                    info.stack.push(ExpressionInstruction {
+                        op: Operation::Mov,
+                        arg1: Operand::DereferencedMemory(Box::new(CalleeSavedRegister::R15), 0),
+                        arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)),
+                    });
+                    info.stack.push(ExpressionInstruction {
+                        op: Operation::Mov,
+                        arg1: Operand::Memory(Box::new(CalleeSavedRegister::R15)),
+                        arg2: Operand::Memory(mem.to_owned()),
+                    });
+                }
 
                 return mem;
             }

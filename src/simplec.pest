@@ -27,13 +27,13 @@ literal = { integer | string }
 
 ident_name = { ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 
-ident = { address_of* ~ ident_name }
+ident = { address_of? ~ ident_name }
 
 address_of = { "&" }
 
 primary_expr = { literal | call | array_access | "(" ~ expression ~ ")" | ident }
 
-array_access = { ident ~ "[" ~ expression ~ "]" }
+array_access = { ident_name ~ ("[" ~ expression ~ "]")+ }
 
 decl = { any_type ~ decl_ident_list ~ ";" }
 
