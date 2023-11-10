@@ -179,6 +179,7 @@ enum ProgramItem {
     },
     Expression {
         stack: Vec<ExpressionInstruction>,
+        /// Where the output of the expression will be found once the stack is executed
         output: Box<dyn Memory>,
         destination: ExpressionDestination,
     },
@@ -204,7 +205,7 @@ impl ProgramItem {
                 writer.write_all(format!(".text\n.globl {name}\n{name}:\n").as_bytes())?;
 
                 // Frame pointer
-                writer.write_all("\tpushq %rbp\n\tmovq %rsp, %rbp\n".as_bytes())?;
+                writer.write_all(b"\tpushq %rbp\n\tmovq %rsp, %rbp\n")?;
 
                 // Registers
                 let mut callee_saved = vec![
@@ -229,10 +230,6 @@ impl ProgramItem {
 
                 if stack_allocs > 0 {
                     writer.write_all(format!("\tsubq ${}, %rsp\n", stack_allocs * 8).as_bytes())?;
-                    // writer.write_all("\txorq %r15, %r15\n".as_bytes())?;
-                    // for _ in 0..stack_allocs {
-                    //     writer.write_all("\tpushq %r15\n".as_bytes())?;
-                    // }
                 }
 
                 // Args
@@ -252,9 +249,6 @@ impl ProgramItem {
                 writer.write_all(format!("__{name}_exit:\n").as_bytes())?;
 
                 if stack_allocs > 0 {
-                    // for _ in 0..stack_allocs {
-                    //     writer.write_all("\tpopq %r15\n".as_bytes())?;
-                    // }
                     writer.write_all(format!("\taddq ${}, %rsp\n", stack_allocs * 8).as_bytes())?;
                 }
 
@@ -265,7 +259,7 @@ impl ProgramItem {
                 }
 
                 // Leave and return
-                writer.write_all("\tleave\n\tret\n".as_bytes())?;
+                writer.write_all(b"\tleave\n\tret\n")?;
 
                 Ok(())
             }
@@ -283,7 +277,7 @@ impl ProgramItem {
                 }
 
                 // Safety for variadics if called
-                writer.write_all("\txorq %rax, %rax\n".as_bytes())?;
+                writer.write_all(b"\txorq %rax, %rax\n")?;
 
                 writer.write_all(format!("\tcall {name}\n").as_bytes())?;
 
@@ -305,12 +299,10 @@ impl ProgramItem {
                                 writer.write_all(
                                     format!("\tmovq {}, %r15\n", output.to_string()).as_bytes(),
                                 )?;
-                                // TODO: What if v.offset != None?
                                 writer.write_all(
                                     format!("\tmovq %r15, {}\n", m.to_string()).as_bytes(),
                                 )?;
                             } else {
-                                // TODO: What if v.offset != None?
                                 writer.write_all(
                                     format!("\tmovq {}, {}\n", output.to_string(), m.to_string())
                                         .as_bytes(),
@@ -337,10 +329,40 @@ impl ProgramItem {
                             )?;
 
                             if flag {
-                                writer.write_all("\tpopq %r14\n".as_bytes())?;
+                                writer.write_all(b"\tpopq %r14\n")?;
                             }
                         },
-                        RealizedVariable::Offset(inner, offset) => todo!(),
+                        RealizedVariable::Offset { base, offsets, items } => {
+                            for item in items {
+                                item.write(writer)?;
+                            }
+
+                            writer.write_all(
+                                format!("\tpushq %r14\n\tmovq {}, %r14\n", output.to_string())
+                                    .as_bytes(),
+                            )?;
+
+                            match *base {
+                                RealizedVariable::Memory(mem) => {
+                                    writer.write_all(b"\tmovq %rbp, %r15\n")?;
+                                    writer.write_all(format!("\tsubq ${}, %r15\n", mem.stack_offset()).as_bytes())?;
+                                },
+                                RealizedVariable::Global(name) => {
+                                    writer.write_all(format!("\tmovq ${name}, %r15\n").as_bytes())?;
+                                },
+                                RealizedVariable::Offset{..} => unreachable!(),
+                            }
+
+                            writer.write_all(b"\tmovq (%r15), %r15\n")?;
+
+                            for offset in offsets.iter().take(offsets.len() - 1) {
+                                writer.write_all(format!("\taddq {}, %r15\n", offset.to_string()).as_bytes())?;
+                                writer.write_all(b"\tmovq (%r15), %r15\n")?;
+                            }
+
+                            writer.write_all(format!("\taddq {}, %r15\n", offsets.last().unwrap().to_string()).as_bytes())?;
+                            writer.write_all(b"\tmovq %r14, (%r15)\n\tpopq %r14\n")?;
+                        },
                     },
                     ExpressionDestination::ConditionalJump(_) => todo!(),
                 }
@@ -350,7 +372,7 @@ impl ProgramItem {
             Self::Return { name, value } => {
                 if value.is_empty() {
                     // Return 0
-                    writer.write_all("\txorq %rax, %rax\n".as_bytes())?;
+                    writer.write_all(b"\txorq %rax, %rax\n")?;
                 } else {
                     for value in value {
                         value.write(writer)?;
@@ -501,10 +523,17 @@ impl MemoryManager {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum RealizedVariable {
     Memory(Box<dyn Memory>),
-    Offset(Box<RealizedVariable>, usize),
+    Offset {
+        /// The base identifier, either a Memory location or a Global
+        base: Box<RealizedVariable>,
+        /// The offsets that must be used to get to the final memory location
+        offsets: Vec<Box<dyn Memory>>,
+        /// Program items that must be executed in order to fill the `offsets`
+        items: Vec<ProgramItem>,
+    },
     Global(String),
 }
 
@@ -705,23 +734,21 @@ fn handle_assignment(
     let rv = match dest.as_rule() {
         Rule::array_access => {
             let mut pairs = dest.into_inner();
+
             let ident = pairs.next().unwrap();
+            let base = get_variable_from_ident(local_stack, ident, globals);
+
             let offset_expressions = pairs.collect::<Vec<_>>();
 
+            let (offsets, items): (Vec<_>, Vec<_>) = offset_expressions.into_iter().map(|expression| {
+                let res = memory.next_free_stack_memory();
+                let out = handle_expression(expression.into_inner().next().unwrap(), memory, local_stack, globals, ExpressionDestination::Variable(RealizedVariable::Memory(res.to_owned())), strings);
+                (res, out)
+            }).unzip();
             
-            todo!()
+            RealizedVariable::Offset { base: Box::new(base), offsets, items: items.into_iter().flatten().collect() }
         }
-        Rule::ident_name => local_stack
-            .iter()
-            .find(|(lsv, _)| lsv.as_str() == dest.as_str().trim())
-            .map(|(_, m)| RealizedVariable::Memory(m.to_owned()))
-            .or_else(|| {
-                globals
-                    .iter()
-                    .find(|g| g.as_str() == dest.as_str().trim())
-                    .map(|g| RealizedVariable::Global(g.to_owned()))
-            })
-            .expect("Undeclared variable!"),
+        Rule::ident_name => get_variable_from_ident(local_stack, dest, globals),
         _ => unreachable!(),
     };
 
@@ -733,6 +760,20 @@ fn handle_assignment(
         ExpressionDestination::Variable(rv),
         strings,
     )
+}
+
+fn get_variable_from_ident(local_stack: &HashMap<String, Box<dyn Memory>>, ident: Pair<'_, Rule>, globals: &HashSet<String>) -> RealizedVariable {
+    local_stack
+        .iter()
+        .find(|(lsv, _)| lsv.as_str() == ident.as_str().trim())
+        .map(|(_, m)| RealizedVariable::Memory(m.to_owned()))
+        .or_else(|| {
+            globals
+                .iter()
+                .find(|g| g.as_str() == ident.as_str().trim())
+                .map(|g| RealizedVariable::Global(g.to_owned()))
+        })
+        .expect("Undeclared variable!")
 }
 
 #[derive(Debug)]
@@ -770,7 +811,7 @@ impl ExpressionInstruction {
 #[derive(Debug)]
 enum Operand {
     Memory(Box<dyn Memory>),
-    DereferencedMemory(Box<dyn Memory>, usize),
+    DereferencedMemory(Box<dyn Memory>),
     Global(String),
     StringConstant(usize),
     IntegerConstant(i64),
@@ -781,11 +822,11 @@ impl ToString for Operand {
     fn to_string(&self) -> String {
         match self {
             Operand::Memory(m) => m.to_string(),
-            Operand::DereferencedMemory(m, o) => {
+            Operand::DereferencedMemory(m) => {
                 if m.is_register() {
-                    format!("-{o}({})", m.to_string())
+                    format!("({})", m.to_string())
                 } else {
-                    format!("-{o}{}", m.to_string())
+                    m.to_string()
                 }
             }
             Operand::Global(name) => format!("${name}"),
@@ -963,7 +1004,7 @@ impl Operation {
 fn normalize_memory<W: Write>(writer: &mut W, mem: &mut Operand) -> Result<(), std::io::Error> {
     match *mem {
         Operand::Memory(_) => {}
-        Operand::DereferencedMemory(_, _) => {}
+        Operand::DereferencedMemory(_) => {}
         Operand::Global(_) => {}
         Operand::StringConstant(_) => panic!("Invalid comparison!"),
         Operand::IntegerConstant(c) => {
@@ -989,7 +1030,7 @@ fn write_temp_register_if_needed<W: Write>(
 ) -> Result<Operand, std::io::Error> {
     match arg1 {
         Operand::Memory(_) => match arg2 {
-            Operand::Memory(m2) | Operand::DereferencedMemory(m2, _) => {
+            Operand::Memory(m2) | Operand::DereferencedMemory(m2) => {
                 if m2.is_register() {
                     return Ok(arg1);
                 }
@@ -1000,8 +1041,8 @@ fn write_temp_register_if_needed<W: Write>(
             }
             _ => Ok(arg1),
         },
-        Operand::DereferencedMemory(_, _) => match arg2 {
-            Operand::Memory(m2) | Operand::DereferencedMemory(m2, _) => {
+        Operand::DereferencedMemory(_) => match arg2 {
+            Operand::Memory(m2) | Operand::DereferencedMemory(m2) => {
                 if m2.is_register() {
                     return Ok(arg1);
                 }
@@ -1205,7 +1246,7 @@ fn handle_primary_expression(
 
                 info.stack.push(ExpressionInstruction {
                     op: Operation::Mov,
-                    arg1: Operand::DereferencedMemory(Box::new(CalleeSavedRegister::R15), 0),
+                    arg1: Operand::DereferencedMemory(Box::new(CalleeSavedRegister::R15)),
                     arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)),
                 });
             }
@@ -1220,7 +1261,7 @@ fn handle_primary_expression(
                 });
                 info.stack.push(ExpressionInstruction {
                     op: Operation::Mov,
-                    arg1: Operand::DereferencedMemory(Box::new(CalleeSavedRegister::R15), 0),
+                    arg1: Operand::DereferencedMemory(Box::new(CalleeSavedRegister::R15)),
                     arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)),
                 });
             }
@@ -1242,7 +1283,7 @@ fn handle_primary_expression(
 
                 info.stack.push(ExpressionInstruction { 
                     op: Operation::Mov, 
-                    arg1: Operand::DereferencedMemory(Box::new(CalleeSavedRegister::R15), 0), 
+                    arg1: Operand::DereferencedMemory(Box::new(CalleeSavedRegister::R15)), 
                     arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)) 
                 });
             }
@@ -1322,7 +1363,7 @@ fn handle_primary_expression(
                     });
                     info.stack.push(ExpressionInstruction {
                         op: Operation::Mov,
-                        arg1: Operand::DereferencedMemory(Box::new(CalleeSavedRegister::R15), 0),
+                        arg1: Operand::DereferencedMemory(Box::new(CalleeSavedRegister::R15)),
                         arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)),
                     });
                     info.stack.push(ExpressionInstruction {
