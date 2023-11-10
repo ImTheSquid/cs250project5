@@ -143,7 +143,7 @@ impl ToString for ArgumentRegister {
 #[derive(Debug, Clone, Copy)]
 enum UtilRegister {
     Rax,
-    Rsp,
+    Rbp,
 }
 
 impl Memory for UtilRegister {
@@ -156,7 +156,7 @@ impl ToString for UtilRegister {
     fn to_string(&self) -> String {
         match self {
             Self::Rax => "%rax",
-            Self::Rsp => "%rsp",
+            Self::Rbp => "%rbp",
         }
         .to_string()
     }
@@ -845,7 +845,7 @@ impl Operation {
                 )?;
 
                 // I forgot how subtraction works but this seems to fix the problem
-                writer.write_all(format!("\tnegq {}\n", arg2.to_string()).as_bytes())?;
+                // writer.write_all(format!("\tnegq {}\n", arg2.to_string()).as_bytes())?;
 
                 Ok(())
             }
@@ -1182,7 +1182,81 @@ fn handle_primary_expression(
 
             dest
         }
-        Rule::array_access => todo!(),
+        Rule::array_access => {
+            let mut pairs = pair.into_inner();
+            let ident = pairs.next().unwrap();
+
+            let local_var = local_stack
+                .iter()
+                .find(|(lsv, _)| lsv.as_str() == ident.as_str().trim());
+
+            if let Some((_, local_mem)) = local_var {
+                info.stack.push(ExpressionInstruction { 
+                    op: Operation::Mov, 
+                    arg1: Operand::Memory(Box::new(UtilRegister::Rbp)), 
+                    arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)) 
+                });
+
+                info.stack.push(ExpressionInstruction { 
+                    op: Operation::Sub, 
+                    arg1: Operand::IntegerConstant(local_mem.stack_offset() as i64), 
+                    arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)) 
+                });
+
+                info.stack.push(ExpressionInstruction {
+                    op: Operation::Mov,
+                    arg1: Operand::DereferencedMemory(Box::new(CalleeSavedRegister::R15), 0),
+                    arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)),
+                });
+            }
+
+            let global_var = globals.iter().find(|g| g.as_str() == ident.as_str().trim());
+
+            if let Some(global) = global_var {
+                info.stack.push(ExpressionInstruction {
+                    op: Operation::Mov,
+                    arg1: Operand::Global(global.to_owned()),
+                    arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)),
+                });
+                info.stack.push(ExpressionInstruction {
+                    op: Operation::Mov,
+                    arg1: Operand::DereferencedMemory(Box::new(CalleeSavedRegister::R15), 0),
+                    arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)),
+                });
+            }
+
+            if global_var.is_none() && local_var.is_none() {
+                panic!("Undefined variable!");
+            }
+
+            let offset_expressions = pairs.collect::<Vec<_>>();
+
+            for expression in offset_expressions {
+                let es = build_expression_stack(expression.into_inner().next().unwrap(), info, local_stack, globals, strings);
+                
+                info.stack.push(ExpressionInstruction { 
+                    op: Operation::Add, 
+                    arg1: Operand::Memory(es), 
+                    arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15))
+                });
+
+                info.stack.push(ExpressionInstruction { 
+                    op: Operation::Mov, 
+                    arg1: Operand::DereferencedMemory(Box::new(CalleeSavedRegister::R15), 0), 
+                    arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)) 
+                });
+            }
+
+            let mem = info.memory.next_free_stack_memory();
+
+            info.stack.push(ExpressionInstruction { 
+                op: Operation::Mov, 
+                arg1: Operand::Memory(Box::new(CalleeSavedRegister::R15)), 
+                arg2: Operand::Memory(mem.to_owned()) 
+            });
+
+            mem
+        },
         Rule::expression => build_expression_stack(
             pair.into_inner().next().unwrap(),
             info,
@@ -1209,12 +1283,12 @@ fn handle_primary_expression(
                 if address_of {
                     info.stack.push(ExpressionInstruction { 
                         op: Operation::Mov, 
-                        arg1: Operand::Memory(Box::new(UtilRegister::Rsp)), 
+                        arg1: Operand::Memory(Box::new(UtilRegister::Rbp)), 
                         arg2: Operand::Memory(mem.to_owned()) 
                     });
 
                     info.stack.push(ExpressionInstruction { 
-                        op: Operation::Add, 
+                        op: Operation::Sub, 
                         arg1: Operand::IntegerConstant(local_mem.stack_offset() as i64), 
                         arg2: Operand::Memory(mem.to_owned()) 
                     });
@@ -1349,15 +1423,24 @@ fn mathematic_variadic_expression_helper(
                 let top = sub_expressions.pop_back().expect("Invalid expression!");
                 let second = sub_expressions.pop_back().expect("Invalid expression!");
 
+                let op = match item.as_str() {
+                    "*" => Operation::Mult,
+                    "/" => Operation::Div,
+                    "%" => Operation::Mod,
+                    "+" => Operation::Add,
+                    "-" => Operation::Sub,
+                    _ => unreachable!(),
+                };
+
+                // Gotta switch subtraction for some reason, everything else works fine?
+                let (top, second) = if matches!(op, Operation::Sub) {
+                    (second, top)
+                } else {
+                    (top, second)
+                };
+
                 sub_expressions.push_back(StackEvaluationStep::Expression(
-                    match item.as_str() {
-                        "*" => Operation::Mult,
-                        "/" => Operation::Div,
-                        "%" => Operation::Mod,
-                        "+" => Operation::Add,
-                        "-" => Operation::Sub,
-                        _ => unreachable!(),
-                    },
+                   op,
                     Box::new(second),
                     Box::new(top),
                 ));
