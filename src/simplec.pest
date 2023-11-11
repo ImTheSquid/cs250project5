@@ -62,7 +62,7 @@ while_expr = { "while" ~ "(" ~ expression ~ ")" ~ "{" ~ statement_list ~ "}" }
 
 do_while_expr = { "do" ~ "{" ~ statement_list ~ "}" ~ "while" ~ "(" ~ expression ~ ")" ~ ";" }
 
-for_expr = { "for" ~ "(" ~ assignment ~ expression ~ ";" ~ assignment ~ ")" ~ "{" ~ statement_list ~ "}" }
+for_expr = { "for" ~ "(" ~ assignment ~ ";" ~ expression ~ ";" ~ assignment ~ ")" ~ "{" ~ statement_list ~ "}" }
 
 flow_control = { (continue | break | return) ~ ";"}
 

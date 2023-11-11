@@ -40,6 +40,10 @@ trait Memory: ToString + Debug + DynClone {
     fn stack_offset(&self) -> usize {
         panic!("This is not a stack! Stack offset not implemented.")
     }
+
+    fn lowest_byte(&self) -> String {
+        self.to_string()
+    }
 }
 
 dyn_clone::clone_trait_object!(Memory);
@@ -64,6 +68,17 @@ const REGISTER_STACK: [CalleeSavedRegister; 5] = [
 impl Memory for CalleeSavedRegister {
     fn is_register(&self) -> bool {
         true
+    }
+
+    fn lowest_byte(&self) -> String {
+        match self {
+            CalleeSavedRegister::Rbx => "%bl",
+            CalleeSavedRegister::R10 => "%r10b",
+            CalleeSavedRegister::R13 => "%r13b",
+            CalleeSavedRegister::R14 => "%r14b",
+            CalleeSavedRegister::R15 => "%r15b",
+        }
+        .to_string()
     }
 }
 
@@ -181,12 +196,37 @@ enum ProgramItem {
         stack: Vec<ExpressionInstruction>,
         /// Where the output of the expression will be found once the stack is executed
         output: Box<dyn Memory>,
-        destination: ExpressionDestination,
+        destination: RealizedVariable,
     },
     Return {
         name: String,
         value: Vec<ProgramItem>,
     },
+    BreakOrContinue {
+        name: String,
+    },
+    While {
+        jump: JumpDestination,
+        expression: Vec<ProgramItem>,
+        output: Box<dyn Memory>,
+        children: Vec<ProgramItem>,
+        is_do_while: bool,
+    },
+    For {
+        jump: JumpDestination,
+        init: Vec<ProgramItem>,
+        condition: Vec<ProgramItem>,
+        output: Box<dyn Memory>,
+        incrementor: Vec<ProgramItem>,
+        children: Vec<ProgramItem>,
+    },
+    If {
+        jump: JumpDestination,
+        condition: Vec<ProgramItem>,
+        output: Box<dyn Memory>,
+        children: Vec<ProgramItem>,
+        else_children: Vec<ProgramItem>,
+    }
 }
 
 impl ProgramItem {
@@ -293,78 +333,75 @@ impl ProgramItem {
                 }
 
                 match destination {
-                    ExpressionDestination::Variable(v) => match v {
-                        RealizedVariable::Memory(m) => {
-                            if !output.is_register() && !m.is_register() {
-                                writer.write_all(
-                                    format!("\tmovq {}, %r15\n", output.to_string()).as_bytes(),
-                                )?;
-                                writer.write_all(
-                                    format!("\tmovq %r15, {}\n", m.to_string()).as_bytes(),
-                                )?;
-                            } else {
-                                writer.write_all(
-                                    format!("\tmovq {}, {}\n", output.to_string(), m.to_string())
-                                        .as_bytes(),
-                                )?;
-                            }
-                        }
-                        RealizedVariable::Global(g) => {
-                            let (output, flag): (Box<dyn Memory>, bool) = if !output.is_register() {
-                                writer.write_all(
-                                    format!("\tpushq %r14\n\tmovq {}, %r14\n", output.to_string())
-                                        .as_bytes(),
-                                )?;
-                                (Box::new(CalleeSavedRegister::R14), true)
-                            } else {
-                                (output, false)
-                            };
-
+                    RealizedVariable::Memory(m) => {
+                        if !output.is_register() && !m.is_register() {
                             writer.write_all(
-                                format!(
-                                    "\tmovq ${g}, %r15\n\tmovq {}, (%r15)\n",
-                                    output.to_string()
-                                )
-                                .as_bytes(),
+                                format!("\tmovq {}, %r15\n", output.to_string()).as_bytes(),
                             )?;
-
-                            if flag {
-                                writer.write_all(b"\tpopq %r14\n")?;
-                            }
-                        },
-                        RealizedVariable::Offset { base, offsets, items } => {
-                            for item in items {
-                                item.write(writer)?;
-                            }
-
+                            writer.write_all(
+                                format!("\tmovq %r15, {}\n", m.to_string()).as_bytes(),
+                            )?;
+                        } else {
+                            writer.write_all(
+                                format!("\tmovq {}, {}\n", output.to_string(), m.to_string())
+                                    .as_bytes(),
+                            )?;
+                        }
+                    }
+                    RealizedVariable::Global(g) => {
+                        let (output, flag): (Box<dyn Memory>, bool) = if !output.is_register() {
                             writer.write_all(
                                 format!("\tpushq %r14\n\tmovq {}, %r14\n", output.to_string())
                                     .as_bytes(),
                             )?;
+                            (Box::new(CalleeSavedRegister::R14), true)
+                        } else {
+                            (output, false)
+                        };
 
-                            match *base {
-                                RealizedVariable::Memory(mem) => {
-                                    writer.write_all(b"\tmovq %rbp, %r15\n")?;
-                                    writer.write_all(format!("\tsubq ${}, %r15\n", mem.stack_offset()).as_bytes())?;
-                                },
-                                RealizedVariable::Global(name) => {
-                                    writer.write_all(format!("\tmovq ${name}, %r15\n").as_bytes())?;
-                                },
-                                RealizedVariable::Offset{..} => unreachable!(),
-                            }
+                        writer.write_all(
+                            format!(
+                                "\tmovq ${g}, %r15\n\tmovq {}, (%r15)\n",
+                                output.to_string()
+                            )
+                            .as_bytes(),
+                        )?;
 
-                            writer.write_all(b"\tmovq (%r15), %r15\n")?;
-
-                            for offset in offsets.iter().take(offsets.len() - 1) {
-                                writer.write_all(format!("\taddq {}, %r15\n", offset.to_string()).as_bytes())?;
-                                writer.write_all(b"\tmovq (%r15), %r15\n")?;
-                            }
-
-                            writer.write_all(format!("\taddq {}, %r15\n", offsets.last().unwrap().to_string()).as_bytes())?;
-                            writer.write_all(b"\tmovq %r14, (%r15)\n\tpopq %r14\n")?;
-                        },
+                        if flag {
+                            writer.write_all(b"\tpopq %r14\n")?;
+                        }
                     },
-                    ExpressionDestination::ConditionalJump(_) => todo!(),
+                    RealizedVariable::Offset { base, offsets, items } => {
+                        for item in items {
+                            item.write(writer)?;
+                        }
+
+                        writer.write_all(
+                            format!("\tpushq %r14\n\tmovq {}, %r14\n", output.to_string())
+                                .as_bytes(),
+                        )?;
+
+                        match *base {
+                            RealizedVariable::Memory(mem) => {
+                                writer.write_all(b"\tmovq %rbp, %r15\n")?;
+                                writer.write_all(format!("\tsubq ${}, %r15\n", mem.stack_offset()).as_bytes())?;
+                            },
+                            RealizedVariable::Global(name) => {
+                                writer.write_all(format!("\tmovq ${name}, %r15\n").as_bytes())?;
+                            },
+                            RealizedVariable::Offset{..} => unreachable!(),
+                        }
+
+                        writer.write_all(b"\tmovq (%r15), %r15\n")?;
+
+                        for offset in offsets.iter().take(offsets.len() - 1) {
+                            writer.write_all(format!("\taddq {}, %r15\n", offset.to_string()).as_bytes())?;
+                            writer.write_all(b"\tmovq (%r15), %r15\n")?;
+                        }
+
+                        writer.write_all(format!("\taddq {}, %r15\n", offsets.last().unwrap().to_string()).as_bytes())?;
+                        writer.write_all(b"\tmovq %r14, (%r15)\n\tpopq %r14\n")?;
+                    },
                 }
 
                 Ok(())
@@ -380,6 +417,92 @@ impl ProgramItem {
                 }
 
                 writer.write_all(format!("\tjmp __{}_exit\n", name).as_bytes())?;
+
+                Ok(())
+            },
+            Self::BreakOrContinue { name } => writer.write_all(format!("\tjmp {name}\n").as_bytes()),
+            Self::While { jump, expression, output, children, is_do_while } => {
+                writer.write_all(format!("{}:\n", jump.then).as_bytes())?;
+
+                let mut opt = Some(expression);
+
+                if !is_do_while {
+                    // Write the condition
+                    for item in opt.take().unwrap() {
+                        item.write(writer)?;
+                    }
+
+                    writer.write_all(format!("\tcmpq $0, {}\n\tjz {}\n", output.to_string(), jump.end).as_bytes())?;
+                }
+
+                for child in children {
+                    child.write(writer)?;
+                }
+
+                if is_do_while {
+                    // Write the condition
+                    for item in opt.take().unwrap() {
+                        item.write(writer)?;
+                    }
+
+                    writer.write_all(format!("\tcmpq $0, {}\n\tjz {}\n", output.to_string(), jump.end).as_bytes())?;
+                }
+
+                writer.write_all(format!("\tjmp {}\n{}:\n", jump.then, jump.end).as_bytes())?;
+
+                Ok(())
+            },
+            Self::For { jump, init, condition, output, incrementor, children } => {
+                for item in init {
+                    item.write(writer)?;
+                }
+
+                writer.write_all(format!("{}:\n", jump.then).as_bytes())?;
+
+                for item in condition {
+                    item.write(writer)?;
+                }
+
+                writer.write_all(format!("\tcmpq $0, {}\n\tjz {}\n", output.to_string(), jump.end).as_bytes())?;
+
+                for child in children {
+                    child.write(writer)?;
+                }
+
+                writer.write_all(format!("{}:\n", jump.incr).as_bytes())?;
+
+                for item in incrementor {
+                    item.write(writer)?;
+                }
+
+                writer.write_all(format!("\tjmp {}\n{}:\n", jump.then, jump.end).as_bytes())?;
+
+                Ok(())
+            },
+            Self::If { jump, condition, output, children, else_children } => {
+                for item in condition {
+                    item.write(writer)?;
+                }
+
+                writer.write_all(format!("\tcmpq $0, {}\n\tjz {}\n", output.to_string(), if else_children.is_empty() {
+                    &jump.end
+                } else {
+                    &jump.then
+                }).as_bytes())?;
+
+                for child in children {
+                    child.write(writer)?;
+                }
+
+                if !else_children.is_empty() {
+                    writer.write_all(format!("\tjmp {}\n{}:\n", jump.end, jump.then).as_bytes())?;
+
+                    for child in else_children {
+                        child.write(writer)?;
+                    }
+                }
+
+                writer.write_all(format!("{}:\n", jump.end).as_bytes())?;
 
                 Ok(())
             }
@@ -590,58 +713,141 @@ fn handle_function(
     }
 
     // Function may not have a body
-    let children: Vec<ProgramItem> = if let Some(statements) = statements {
-        statements
-            .into_inner()
-            .flat_map(|statement| match statement.as_rule() {
-                Rule::decl => {
-                    handle_local_decl(statement, &mut memory, &mut local_stack, globals);
-                    vec![]
-                }
-                Rule::assignment => {
-                    handle_assignment(statement, &mut memory, &local_stack, globals, strings)
-                }
-                Rule::call => {
-                    handle_function_call(statement, &mut memory, &local_stack, globals, strings)
-                }
-                Rule::if_expr => todo!(),
-                Rule::while_expr => todo!(),
-                Rule::do_while_expr => todo!(),
-                Rule::for_expr => todo!(),
-                Rule::flow_control => {
-                    // continue and return are not allowed in the outermost scope, so this has to be a return
-                    let flow_control = statement.into_inner().next().unwrap().into_inner().next();
-
-                    vec![ProgramItem::Return {
-                        name: ident.to_string(),
-                        value: flow_control
-                            .map(|p| {
-                                handle_expression(
-                                    p,
-                                    &mut memory,
-                                    &local_stack,
-                                    globals,
-                                    ExpressionDestination::Variable(RealizedVariable::Memory(Box::new(
-                                        UtilRegister::Rax,
-                                    ))),
-                                    strings,
-                                )
-                            })
-                            .unwrap_or_default(),
-                    }]
-                }
-                _ => unreachable!(),
-            })
-            .collect()
-    } else {
-        vec![]
-    };
+    let children: Vec<ProgramItem> = extract_children(statements, &mut memory, local_stack, globals, strings, ident, None);
 
     ProgramItem::Function {
         name: ident.to_string(),
         stack_allocs: memory.stack_allocs,
         arg_destinations: arg_mems,
         children,
+    }
+}
+
+fn extract_children(statements: Option<Pair<'_, Rule>>, memory: &mut MemoryManager, mut local_stack: HashMap<String, Box<dyn Memory>>, globals: &HashSet<String>, strings: &mut Vec<String>, fn_name: &str, cfsi: Option<ControlFlowStateInformation>) -> Vec<ProgramItem> {
+    if let Some(statements) = statements {
+        statements
+            .into_inner()
+            .flat_map(|statement| match statement.as_rule() {
+                Rule::decl => {
+                    handle_local_decl(statement, memory, &mut local_stack, globals);
+                    vec![]
+                }
+                Rule::assignment => {
+                    handle_assignment(statement, memory, &local_stack, globals, strings)
+                }
+                Rule::call => {
+                    handle_function_call(statement, memory, &local_stack, globals, strings)
+                }
+                Rule::if_expr |
+                Rule::while_expr |
+                Rule::do_while_expr |
+                Rule::for_expr => handle_sub_scope(statement, *memory, local_stack.clone(), globals, strings, fn_name, cfsi.clone()),
+                Rule::flow_control => {
+                    let pair = statement.into_inner().next().unwrap();
+                    match pair.as_rule() {
+                        Rule::r#return => {
+                            let flow_control = pair.into_inner().next();
+
+                            vec![ProgramItem::Return {
+                                name: fn_name.to_string(),
+                                value: flow_control
+                                    .map(|p| {
+                                        handle_expression(
+                                            p,
+                                            memory,
+                                            &local_stack,
+                                            globals,
+                                            RealizedVariable::Memory(Box::new(
+                                                UtilRegister::Rax,
+                                            )),
+                                            strings,
+                                        )
+                                    })
+                                    .unwrap_or_default(),
+                            }]
+                        },
+                        Rule::r#continue => {
+                            vec![
+                                ProgramItem::BreakOrContinue { name: cfsi.as_ref().unwrap().continue_name.clone() }
+                            ]
+                        },
+                        Rule::r#break => {
+                            vec![
+                                ProgramItem::BreakOrContinue { name: cfsi.as_ref().unwrap().break_name.clone() }
+                            ]
+                        },
+                        _ => unreachable!()
+                    }
+                }
+                _ => unreachable!("Impossible branch {:?}", statement.as_str()),
+            })
+            .collect()
+    } else {
+        vec![]
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ControlFlowStateInformation {
+    break_name: String,
+    continue_name: String,
+}
+
+fn handle_sub_scope(pair: Pair<'_, Rule>, mut memory: MemoryManager, local_stack: HashMap<String, Box<dyn Memory>>, globals: &HashSet<String>, strings: &mut Vec<String>, fn_name: &str, cfsi: Option<ControlFlowStateInformation>) -> Vec<ProgramItem> {
+    match pair.as_rule() {
+        Rule::while_expr => {
+            let mut pairs = pair.into_inner();
+            let jump = JumpDestination::new();
+            let mem = memory.next_free_stack_memory();
+            let expr_items = handle_expression(pairs.next().unwrap(), &mut memory, &local_stack, globals, RealizedVariable::Memory(mem.to_owned()), strings);
+
+            let children = extract_children(pairs.next(), &mut memory, local_stack, globals, strings, fn_name, Some(cfsi.unwrap_or(ControlFlowStateInformation { break_name: jump.end.clone(), continue_name: jump.then.clone() })));
+
+            vec![
+                ProgramItem::While { jump, expression: expr_items, output: mem, children, is_do_while: false }
+            ]
+        },
+        Rule::do_while_expr => {
+            let mut pairs = pair.into_inner();
+            let jump = JumpDestination::new();
+            let mem = memory.next_free_stack_memory();
+
+            let children = extract_children(pairs.next(), &mut memory, local_stack.clone(), globals, strings, fn_name, Some(cfsi.unwrap_or(ControlFlowStateInformation { break_name: jump.end.clone(), continue_name: jump.then.clone() })));
+            let expr_items = handle_expression(pairs.next().unwrap(), &mut memory, &local_stack, globals, RealizedVariable::Memory(mem.to_owned()), strings);
+
+            vec![
+                ProgramItem::While { jump, expression: expr_items, output: mem, children, is_do_while: false }
+            ]
+        },
+        Rule::for_expr => {
+            let mut pairs = pair.into_inner();
+            let init_var = handle_assignment(pairs.next().unwrap(), &mut memory, &local_stack, globals, strings);
+            let condition_result = memory.next_free_stack_memory();
+            let condition = handle_expression(pairs.next().unwrap(), &mut memory, &local_stack, globals, RealizedVariable::Memory(condition_result.to_owned()), strings);
+            let incrementor = handle_assignment(pairs.next().unwrap(), &mut memory, &local_stack, globals, strings);
+
+            let jump = JumpDestination::new();
+
+            let children = extract_children(pairs.next(), &mut memory, local_stack, globals, strings, fn_name, Some(cfsi.unwrap_or(ControlFlowStateInformation { break_name: jump.end.clone(), continue_name: jump.incr.clone() })));
+            
+            vec![
+                ProgramItem::For { jump, init: init_var, condition, output: condition_result, incrementor, children }
+            ]
+        },
+        Rule::if_expr => {
+            let mut pairs = pair.into_inner();
+            let condition_result = memory.next_free_stack_memory();
+            let condition = handle_expression(pairs.next().unwrap(), &mut memory, &local_stack, globals, RealizedVariable::Memory(condition_result.to_owned()), strings);
+            let jump = JumpDestination::new();
+
+            let children = extract_children(pairs.next(), &mut memory, local_stack.clone(), globals, strings, fn_name, cfsi.clone());
+            let else_children = extract_children(pairs.next().map(|p| p.into_inner().next().unwrap()), &mut memory, local_stack, globals, strings, fn_name, cfsi);
+            
+            vec![
+                ProgramItem::If { jump, condition, output: condition_result, children, else_children }
+            ]
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -673,7 +879,7 @@ fn handle_function_call(
                 memory,
                 local_stack,
                 globals,
-                ExpressionDestination::Variable(RealizedVariable::Memory(mem.to_owned())),
+                RealizedVariable::Memory(mem.to_owned()),
                 strings,
             )
         })
@@ -714,12 +920,6 @@ fn handle_local_decl(
     }
 }
 
-#[derive(Debug)]
-enum ExpressionDestination {
-    Variable(RealizedVariable),
-    ConditionalJump(JumpDestination),
-}
-
 fn handle_assignment(
     pair: Pair<'_, Rule>,
     memory: &mut MemoryManager,
@@ -742,7 +942,7 @@ fn handle_assignment(
 
             let (offsets, items): (Vec<_>, Vec<_>) = offset_expressions.into_iter().map(|expression| {
                 let res = memory.next_free_stack_memory();
-                let out = handle_expression(expression.into_inner().next().unwrap(), memory, local_stack, globals, ExpressionDestination::Variable(RealizedVariable::Memory(res.to_owned())), strings);
+                let out = handle_expression(expression.into_inner().next().unwrap(), memory, local_stack, globals, RealizedVariable::Memory(res.to_owned()), strings);
                 (res, out)
             }).unzip();
             
@@ -757,7 +957,7 @@ fn handle_assignment(
         memory,
         local_stack,
         globals,
-        ExpressionDestination::Variable(rv),
+        rv,
         strings,
     )
 }
@@ -778,21 +978,9 @@ fn get_variable_from_ident(local_stack: &HashMap<String, Box<dyn Memory>>, ident
 
 #[derive(Debug)]
 struct ExpressionInfo<'a> {
-    depth: usize,
     stack: Vec<ExpressionInstruction>,
     memory: &'a mut MemoryManager,
-    jump_destination: Option<JumpDestination>,
     pre_execution_code: Vec<ProgramItem>,
-}
-
-impl ExpressionInfo<'_> {
-    fn generate_jump_destination(&self) -> JumpDestination {
-        let identifier = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
-        JumpDestination {
-            then: Some(format!("__{}_then", &identifier)),
-            end: format!("__{}_end", &identifier),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -929,7 +1117,7 @@ impl Operation {
                     EqRelOperation::Lte => "setle",
                 };
 
-                writer.write_all(format!("\t{set_type} {}\n", store.to_string()).as_bytes())?;
+                writer.write_all(format!("\t{set_type} {}\n", store.lowest_byte()).as_bytes())?;
                 // This is only a precaution. Theoretically this shouldn't have any higher bytes, but I can't be sure in the future
                 writer.write_all(format!("\tandq $1, {}\n", store.to_string()).as_bytes())?;
 
@@ -945,20 +1133,7 @@ impl Operation {
                     format!("\tcmpq {}, {}\n", arg2.to_string(), arg1.to_string()).as_bytes(),
                 )?;
 
-                let jump_type = match op {
-                    ComparisonOperation::Eq => "jz",
-                    ComparisonOperation::Neq
-                    | ComparisonOperation::Or
-                    | ComparisonOperation::And => "jnz",
-                    ComparisonOperation::Gt => "jg",
-                    ComparisonOperation::Lt => "jl",
-                    ComparisonOperation::Gte => "jge",
-                    ComparisonOperation::Lte => "jle",
-                };
-
-                if let Some(then) = &dest.then {
-                    writer.write_all(format!("\t{jump_type} {then}\n").as_bytes())?;
-                }
+                writer.write_all(format!("\tjnz {}\n", dest.then).as_bytes())?;
 
                 Ok(())
             }
@@ -977,21 +1152,19 @@ impl Operation {
                 )?;
                 writer.write_all(format!("\tjmp {}\n", dest.end).as_bytes())?;
 
-                if let Some(then) = dest.then {
-                    writer.write_all(format!("{}:\n", then).as_bytes())?;
-                    writer.write_all(
-                        format!(
-                            "\tmovq ${}, {}\n",
-                            if matches!(op, ComparisonOperation::Or) {
-                                1
-                            } else {
-                                0
-                            },
-                            store.to_string()
-                        )
-                        .as_bytes(),
-                    )?;
-                }
+                writer.write_all(format!("{}:\n", dest.then).as_bytes())?;
+                writer.write_all(
+                    format!(
+                        "\tmovq ${}, {}\n",
+                        if matches!(op, ComparisonOperation::Or) {
+                            1
+                        } else {
+                            0
+                        },
+                        store.to_string()
+                    )
+                    .as_bytes(),
+                )?;
 
                 writer.write_all(format!("{}:\n", dest.end).as_bytes())?;
 
@@ -1061,12 +1234,6 @@ fn write_temp_register_if_needed<W: Write>(
 enum ComparisonOperation {
     And,
     Or,
-    Eq,
-    Neq,
-    Gt,
-    Lt,
-    Gte,
-    Lte,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1081,8 +1248,20 @@ enum EqRelOperation {
 
 #[derive(Debug, Clone)]
 struct JumpDestination {
-    then: Option<String>,
+    then: String,
+    incr: String,
     end: String,
+}
+
+impl JumpDestination {
+    fn new() -> JumpDestination {
+        let identifier = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
+        JumpDestination {
+            then: format!("__{}_then", &identifier),
+            incr: format!("__{}_incr", &identifier),
+            end: format!("__{}_end", &identifier),
+        }
+    }
 }
 
 fn handle_expression(
@@ -1091,18 +1270,11 @@ fn handle_expression(
     local_stack: &HashMap<String, Box<dyn Memory>>,
     globals: &HashSet<String>,
     // Where to try to jump if a JMP operation is necessary and succeeds
-    destination: ExpressionDestination,
+    destination: RealizedVariable,
     strings: &mut Vec<String>,
 ) -> Vec<ProgramItem> {
-    let jump_destination = match &destination {
-        ExpressionDestination::Variable(_) => None,
-        ExpressionDestination::ConditionalJump(jd) => Some(jd.to_owned()),
-    };
-
     let mut expr_info = ExpressionInfo {
         memory,
-        jump_destination,
-        depth: 0,
         stack: vec![],
         pre_execution_code: vec![],
     };
@@ -1174,7 +1346,6 @@ fn handle_primary_expression(
     globals: &HashSet<String>,
     strings: &mut Vec<String>,
 ) -> Box<dyn Memory> {
-    info.depth += 1;
     let pair = pair.into_inner().next().unwrap();
     match pair.as_rule() {
         Rule::literal => {
@@ -1394,8 +1565,6 @@ fn mathematic_variadic_expression_helper(
         return build_expression_stack(pairs.next().unwrap(), info, local_stack, globals, strings);
     }
 
-    info.depth += 1;
-
     // Convert the pairs to postfix
     let pairs = {
         let mut stack = VecDeque::new();
@@ -1536,17 +1705,15 @@ fn eq_or_rel_expression_helper(
         return build_expression_stack(pairs.next().unwrap(), info, local_stack, globals, strings);
     }
 
-    info.depth += 1;
-
     let left_operand =
         build_expression_stack(pairs.next().unwrap(), info, local_stack, globals, strings);
-    let (eop, cop) = match pairs.next().unwrap().as_str() {
-        "==" => (EqRelOperation::Eq, ComparisonOperation::Eq),
-        "!=" => (EqRelOperation::Neq, ComparisonOperation::Neq),
-        ">" => (EqRelOperation::Gt, ComparisonOperation::Gt),
-        "<" => (EqRelOperation::Lt, ComparisonOperation::Lt),
-        ">=" => (EqRelOperation::Gte, ComparisonOperation::Gte),
-        "<=" => (EqRelOperation::Lte, ComparisonOperation::Lte),
+    let eop = match pairs.next().unwrap().as_str() {
+        "==" => EqRelOperation::Eq,
+        "!=" => EqRelOperation::Neq,
+        ">" => EqRelOperation::Gt,
+        "<" => EqRelOperation::Lt,
+        ">=" => EqRelOperation::Gte,
+        "<=" => EqRelOperation::Lte,
         _ => unreachable!(),
     };
     let right_operand =
@@ -1554,40 +1721,11 @@ fn eq_or_rel_expression_helper(
 
     let mem = info.memory.next_free_memory();
 
-    let has_jump = info.jump_destination.is_some();
-
     info.stack.push(ExpressionInstruction {
-        op: if has_jump {
-            Operation::CmpJmp {
-                op: cop,
-                dest: info
-                    .jump_destination
-                    .clone()
-                    .take()
-                    .unwrap(),
-            }
-        } else {
-            Operation::EqRel { op: eop, store: dyn_clone::clone_box(mem.as_ref()) }
-        },
+        op: Operation::EqRel { op: eop, store: dyn_clone::clone_box(mem.as_ref()) },
         arg1: Operand::Memory(left_operand),
         arg2: Operand::Memory(right_operand),
     });
-
-    if has_jump {
-        info.stack.push(ExpressionInstruction {
-            op: Operation::CmpJmpDestination {
-                op: cop,
-                store: dyn_clone::clone_box(mem.as_ref()),
-                dest: info
-                    .jump_destination
-                    .clone()
-                    .take()
-                    .unwrap(),
-            },
-            arg1: Operand::NoWrite,
-            arg2: Operand::NoWrite,
-        });
-    }
 
     mem
 }
@@ -1605,8 +1743,6 @@ fn variadic_expression_helper(
         return build_expression_stack(pairs.next().unwrap(), info, local_stack, globals, strings);
     }
 
-    info.depth += 1;
-
     let mut ops = VecDeque::new();
     for ops_item in pairs {
         ops.push_back(build_expression_stack(
@@ -1620,10 +1756,7 @@ fn variadic_expression_helper(
 
     // All of these calls should realistically jump to the same place
     // Result storage will happen regardless of whether it's needed because this is a single-pass compiler
-    let dest = info
-        .jump_destination
-        .take()
-        .unwrap_or_else(|| info.generate_jump_destination());
+    let dest = JumpDestination::new();
     let final_result = info.memory.next_free_memory();
 
     // let mut comparison_register = ops.pop_back().unwrap();
