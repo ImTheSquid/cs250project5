@@ -395,10 +395,12 @@ impl ProgramItem {
                         writer.write_all(b"\tmovq (%r15), %r15\n")?;
 
                         for offset in offsets.iter().take(offsets.len() - 1) {
+                            writer.write_all(format!("\tsalq $3, {}\n", offset.to_string()).as_bytes())?;
                             writer.write_all(format!("\taddq {}, %r15\n", offset.to_string()).as_bytes())?;
                             writer.write_all(b"\tmovq (%r15), %r15\n")?;
                         }
 
+                        writer.write_all(format!("\tsalq $3, {}\n", offsets.last().unwrap().to_string()).as_bytes())?;
                         writer.write_all(format!("\taddq {}, %r15\n", offsets.last().unwrap().to_string()).as_bytes())?;
                         writer.write_all(b"\tmovq %r14, (%r15)\n\tpopq %r14\n")?;
                     },
@@ -1033,6 +1035,7 @@ enum Operation {
     Div,
     Mod,
     Mov,
+    ShiftLeft,
     /// Optimized version of CmpJmp for when the value is immediately being put into a variable instead of being used as a condition
     EqRel {
         op: EqRelOperation,
@@ -1169,7 +1172,8 @@ impl Operation {
                 writer.write_all(format!("{}:\n", dest.end).as_bytes())?;
 
                 Ok(())
-            }
+            },
+            Operation::ShiftLeft => writer.write_all(format!("\tsalq {}, {}\n", arg1.to_string(), arg2.to_string()).as_bytes()),
         }
     }
 }
@@ -1443,8 +1447,18 @@ fn handle_primary_expression(
 
             let offset_expressions = pairs.collect::<Vec<_>>();
 
+            let last_mem: Box<dyn Memory> = info.memory.next_free_stack_memory();
+
+            info.stack.push(ExpressionInstruction { op: Operation::Mov, arg1: Operand::Memory(Box::new(CalleeSavedRegister::R15)), arg2: Operand::Memory(last_mem.to_owned()) });
+
             for expression in offset_expressions {
+                let last_mem = last_mem.to_owned();
                 let es = build_expression_stack(expression.into_inner().next().unwrap(), info, local_stack, globals, strings);
+
+                // Multiply by 8
+                info.stack.push(ExpressionInstruction { op: Operation::ShiftLeft, arg1: Operand::IntegerConstant(3), arg2: Operand::Memory(es.to_owned()) });
+
+                info.stack.push(ExpressionInstruction { op: Operation::Mov, arg1: Operand::Memory(last_mem.to_owned()), arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)) });
                 
                 info.stack.push(ExpressionInstruction { 
                     op: Operation::Add, 
@@ -1457,6 +1471,8 @@ fn handle_primary_expression(
                     arg1: Operand::DereferencedMemory(Box::new(CalleeSavedRegister::R15)), 
                     arg2: Operand::Memory(Box::new(CalleeSavedRegister::R15)) 
                 });
+
+                info.stack.push(ExpressionInstruction { op: Operation::Mov, arg1: Operand::Memory(Box::new(CalleeSavedRegister::R15)), arg2: Operand::Memory(last_mem) })
             }
 
             let mem = info.memory.next_free_stack_memory();

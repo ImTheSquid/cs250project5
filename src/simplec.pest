@@ -45,6 +45,8 @@ function_arg_list = { (function_arg ~ ",")* ~ function_arg }
 
 function_arg = { any_type ~ ident }
 
+single_statement = { if_expr | while_expr | do_while_expr | for_expr | flow_control | decl | assignment ~ ";" | call ~ ";" }
+
 statement_list = { (if_expr | while_expr | do_while_expr | for_expr | flow_control | decl | assignment ~ ";" | call ~ ";")* }
 
 // Dereferencing pointers is not allowed
@@ -54,15 +56,15 @@ call = { ident ~ "(" ~ call_list? ~ ")" }
 
 call_list = { (expression ~ ",")* ~ expression }
 
-if_expr = { "if" ~ "(" ~ expression ~ ")" ~ "{" ~ statement_list ~ "}" ~ else_expr? }
+if_expr = { "if" ~ "(" ~ expression ~ ")" ~ ("{" ~ statement_list ~ "}" | single_statement) ~ else_expr? }
 
-else_expr = { "else" ~ "{" ~ statement_list ~ "}" }
+else_expr = { "else" ~ ("{" ~ statement_list ~ "}" | single_statement) }
 
-while_expr = { "while" ~ "(" ~ expression ~ ")" ~ "{" ~ statement_list ~ "}" }
+while_expr = { "while" ~ "(" ~ expression ~ ")" ~ ("{" ~ statement_list ~ "}" | single_statement) }
 
-do_while_expr = { "do" ~ "{" ~ statement_list ~ "}" ~ "while" ~ "(" ~ expression ~ ")" ~ ";" }
+do_while_expr = { "do" ~ ("{" ~ statement_list ~ "}" | single_statement) ~ "while" ~ "(" ~ expression ~ ")" ~ ";" }
 
-for_expr = { "for" ~ "(" ~ assignment ~ ";" ~ expression ~ ";" ~ assignment ~ ")" ~ "{" ~ statement_list ~ "}" }
+for_expr = { "for" ~ "(" ~ assignment ~ ";" ~ expression ~ ";" ~ assignment ~ ")" ~ ("{" ~ statement_list ~ "}" | single_statement) }
 
 flow_control = { (continue | break | return) ~ ";"}
 
