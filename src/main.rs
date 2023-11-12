@@ -877,7 +877,7 @@ fn handle_function_call(
     args.zip(mems.clone())
         .flat_map(|(arg, mem)| {
             handle_expression(
-                arg.into_inner().next().unwrap(),
+                arg,
                 memory,
                 local_stack,
                 globals,
@@ -944,7 +944,7 @@ fn handle_assignment(
 
             let (offsets, items): (Vec<_>, Vec<_>) = offset_expressions.into_iter().map(|expression| {
                 let res = memory.next_free_stack_memory();
-                let out = handle_expression(expression.into_inner().next().unwrap(), memory, local_stack, globals, RealizedVariable::Memory(res.to_owned()), strings);
+                let out = handle_expression(expression, memory, local_stack, globals, RealizedVariable::Memory(res.to_owned()), strings);
                 (res, out)
             }).unzip();
             
@@ -1042,7 +1042,6 @@ enum Operation {
         store: Box<dyn Memory>,
     },
     CmpJmp {
-        op: ComparisonOperation,
         dest: JumpDestination,
     },
     /// The destination for the previous CmpJmp operation
@@ -1071,16 +1070,9 @@ impl Operation {
             Operation::Add => writer.write_all(
                 format!("\taddq {}, {}\n", arg1.to_string(), arg2.to_string()).as_bytes(),
             ),
-            Operation::Sub => {
-                writer.write_all(
-                    format!("\tsubq {}, {}\n", arg1.to_string(), arg2.to_string()).as_bytes(),
-                )?;
-
-                // I forgot how subtraction works but this seems to fix the problem
-                // writer.write_all(format!("\tnegq {}\n", arg2.to_string()).as_bytes())?;
-
-                Ok(())
-            }
+            Operation::Sub => writer.write_all(
+                format!("\tsubq {}, {}\n", arg1.to_string(), arg2.to_string()).as_bytes(),
+            ),
             Operation::Mult => {
                 writer
                     .write_all(format!("\tmovq {}, %rax\n\tcqo\n", arg1.to_string()).as_bytes())?;
@@ -1126,11 +1118,9 @@ impl Operation {
 
                 Ok(())
             },
-            Operation::CmpJmp { op, dest } => {
-                if matches!(op, ComparisonOperation::And | ComparisonOperation::Or) {
-                    // Normalize the values (the second value is always 0 or 1, so always normalized)
-                    normalize_memory(writer, &mut arg2)?;
-                }
+            Operation::CmpJmp { dest } => {
+                // Normalize the values (the second value is always 0 or 1, so always normalized)
+                normalize_memory(writer, &mut arg2)?;
 
                 writer.write_all(
                     format!("\tcmpq {}, {}\n", arg2.to_string(), arg1.to_string()).as_bytes(),
@@ -1704,7 +1694,6 @@ fn mathematic_variadic_expression_helper(
 
     // Convert the subexpressions into expression operations that can be evaluated and written
     // Using an inside out traversal, this can be done pretty easily
-
     convert_subexpression_to_operations(info, Box::new(sub_expressions.pop_front().unwrap()))
 }
 
@@ -1777,18 +1766,8 @@ fn variadic_expression_helper(
 
     // let mut comparison_register = ops.pop_back().unwrap();
     while let Some(op_mem) = ops.pop_back() {
-        // If needed, allocate a new JMP destination and register to store the result
-        // If this is the last instruction to be generated, then take the one out of `info` if it exists
-        // let dest = if !ops.is_empty() {
-        //     info.generate_jump_destination()
-        // } else {
-        //     info.jump_destination.take().unwrap_or_else(|| info.generate_jump_destination())
-        // };
-        // let next_result = info.memory.next_free_memory();
-
         info.stack.push(ExpressionInstruction {
             op: Operation::CmpJmp {
-                op,
                 dest: dest.clone(),
             },
             arg1: Operand::Memory(op_mem),
