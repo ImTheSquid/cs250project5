@@ -177,7 +177,7 @@ impl ToString for UtilRegister {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ProgramItem {
     /// Generates a global with a name
     /// Type is not necessary since types don't really exist
@@ -304,11 +304,6 @@ impl ProgramItem {
                 Ok(())
             }
             Self::FunctionCall { name, args } => {
-                assert!(
-                    args.len() <= ARGUMENT_REGISTERS.len(),
-                    "More args than supported for function `{name}`"
-                );
-
                 for (src, reg) in args.into_iter().zip(ARGUMENT_REGISTERS) {
                     // writer.write_all(format!("\tmovq %{} %{}\n", src.to_string(), dest.to_string()).as_bytes())?;
                     writer.write_all(
@@ -684,7 +679,7 @@ impl MemoryManager {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RealizedVariableOffsetInfo {
     offset: Box<dyn Memory>,
     /// The size of the pointed to type
@@ -699,7 +694,7 @@ impl RealizedVariableOffsetInfo {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum RealizedVariable {
     Memory(Box<dyn Memory>),
     Offset {
@@ -1049,10 +1044,9 @@ fn get_variable_from_ident(local_stack: &HashMap<String, LocalVariable>, ident: 
 struct ExpressionInfo<'a> {
     stack: Vec<ExpressionInstruction>,
     memory: &'a mut MemoryManager,
-    pre_execution_code: Vec<ProgramItem>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ExpressionInstruction {
     op: Operation,
     arg1: Operand,
@@ -1065,7 +1059,7 @@ impl ExpressionInstruction {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Operand {
     Memory(Box<dyn Memory>),
     DereferencedMemory(Box<dyn Memory>),
@@ -1118,6 +1112,7 @@ enum Operation {
         store: Box<dyn Memory>,
         dest: JumpDestination,
     },
+    ProgramItem(Vec<ProgramItem>),
 }
 
 impl Operation {
@@ -1235,6 +1230,12 @@ impl Operation {
                 Ok(())
             },
             Operation::ShiftLeft => writer.write_all(format!("\tsalq {}, {}\n", arg1.to_string(), arg2.to_string()).as_bytes()),
+            Operation::ProgramItem(pis) => { 
+                for pi in pis {
+                    pi.write(writer)?;
+                }
+                Ok(())
+            },
         }
     }
 }
@@ -1341,7 +1342,6 @@ fn handle_expression(
     let mut expr_info = ExpressionInfo {
         memory,
         stack: vec![],
-        pre_execution_code: vec![],
     };
 
     let expr = build_expression_stack(
@@ -1352,15 +1352,11 @@ fn handle_expression(
         strings,
     );
 
-    expr_info
-        .pre_execution_code
-        .into_iter()
-        .chain(vec![ProgramItem::Expression {
-            stack: expr_info.stack,
-            output: expr,
-            destination,
-        }])
-        .collect()
+    vec![ProgramItem::Expression {
+        stack: expr_info.stack,
+        output: expr,
+        destination,
+    }]
 }
 
 fn build_expression_stack(
@@ -1441,13 +1437,13 @@ fn handle_primary_expression(
             }
         }
         Rule::call => {
-            info.pre_execution_code.append(&mut handle_function_call(
+            info.stack.push(ExpressionInstruction { op: Operation::ProgramItem(handle_function_call(
                 pair,
                 info.memory,
                 local_stack,
                 globals,
                 strings,
-            ));
+            )), arg1: Operand::NoWrite, arg2: Operand::NoWrite});
 
             let dest = info.memory.next_free_memory();
 
@@ -1834,37 +1830,18 @@ fn variadic_expression_helper(
         return build_expression_stack(pairs.next().unwrap(), info, local_stack, globals, strings);
     }
 
-    let mut ops = VecDeque::new();
-    for ops_item in pairs {
-        ops.push_back(build_expression_stack(
-            ops_item,
-            info,
-            local_stack,
-            globals,
-            strings,
-        ));
-    }
-
-    // All of these calls should realistically jump to the same place
-    // Result storage will happen regardless of whether it's needed because this is a single-pass compiler
     let dest = JumpDestination::new();
     let final_result = info.memory.next_free_memory();
 
-    // let mut comparison_register = ops.pop_back().unwrap();
-    while let Some(op_mem) = ops.pop_back() {
-        info.stack.push(ExpressionInstruction {
-            op: Operation::CmpJmp {
-                dest: dest.clone(),
-            },
-            arg1: Operand::Memory(op_mem),
-            arg2: if op == ComparisonOperation::And {
-                Operand::IntegerConstant(1)
-            } else {
-                Operand::IntegerConstant(0)
-            },
-        });
+    // let mut ops = VecDeque::new();
+    for ops_item in pairs {
+        let output = build_expression_stack(ops_item, info, local_stack, globals, strings);
 
-        // comparison_register = next_result;
+        info.stack.push(ExpressionInstruction { op: Operation::CmpJmp { dest: dest.clone() }, arg1: Operand::Memory(output), arg2: Operand::IntegerConstant(match op {
+            ComparisonOperation::And => 1,
+            ComparisonOperation::Or => 0
+        }) })
+        
     }
 
     info.stack.push(ExpressionInstruction {
