@@ -922,6 +922,11 @@ fn handle_function_call(
 
     if pairs.len() > ARGUMENT_REGISTERS.len() {
         panic!("Too many arguments!");
+    } else if pairs.len() == 0 {
+        return vec![ProgramItem::FunctionCall {
+            name: ident.as_str().to_owned(),
+            args: vec![],
+        }];
     }
 
     let args = pairs.next().unwrap().into_inner();
